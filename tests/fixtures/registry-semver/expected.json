@@ -1,0 +1,5 @@
+{
+  "native": [
+    {"name": "StringSplitter", "type": "registry", "version": "1.0.0", "owner": "aharshac"}
+  ]
+}

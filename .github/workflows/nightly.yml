@@ -1,0 +1,96 @@
+name: Nightly
+
+on:
+  schedule:
+    # 04:00 UTC daily
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  # Only run if there were commits in the last 24 hours
+  check-activity:
+    runs-on: ubuntu-latest
+    outputs:
+      has-changes: ${{ steps.check.outputs.has-changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for recent commits
+        id: check
+        run: |
+          recent=$(git log --oneline --since="24 hours ago" | head -1)
+          if [ -n "$recent" ]; then
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+            echo "Recent commit: $recent"
+          else
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+            echo "No commits in the last 24 hours — skipping"
+          fi
+
+  full-suite:
+    needs: check-activity
+    if: needs.check-activity.outputs.has-changes == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pio-version:
+          - "platformio"            # latest stable
+          - "platformio>=6.1,<6.2"  # current major
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO (${{ matrix.pio-version }}) and test dependencies
+        run: pip install "${{ matrix.pio-version }}" pytest pytest-cov ruff mypy
+
+      - name: Show PlatformIO version
+        run: pio system info
+
+      - name: Lint
+        run: ruff check . && ruff format --check . && mypy pio_lock.py
+
+      - name: Run full test suite
+        run: >
+          pytest -v
+          --tb=short
+          --junitxml=reports/junit.xml
+          --cov=pio_lock
+          --cov-report=term-missing
+          --cov-report=html:reports/htmlcov
+
+      - name: Test summary
+        if: always()
+        run: |
+          {
+            echo "## Nightly (PIO: ${{ matrix.pio-version }})"
+            echo ""
+            python3 -c "
+          import xml.etree.ElementTree as ET, sys
+          try:
+              t = ET.parse('reports/junit.xml').getroot().find('testsuite')
+              tests, fail, err, skip = t.get('tests','0'), t.get('failures','0'), t.get('errors','0'), t.get('skipped','0')
+              passed = int(tests) - int(fail) - int(err) - int(skip)
+              icon = ':white_check_mark:' if fail == '0' and err == '0' else ':x:'
+              print(f'{icon} **{passed} passed**, {fail} failed, {err} errors, {skip} skipped ({tests} total)')
+          except Exception as e:
+              print(f':warning: Could not parse test results: {e}')
+          "
+            echo ""
+            echo "### Coverage"
+            echo '```'
+            python3 -m coverage report --skip-empty 2>/dev/null || echo "Coverage data not available"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-reports-pio-${{ strategy.job-index }}
+          path: reports/
+          retention-days: 30

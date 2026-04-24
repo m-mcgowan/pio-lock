@@ -1,0 +1,79 @@
+[project]
+name = "pio-lock"
+version = "0.1.0"
+description = "PlatformIO dependency lockfile tool for reproducible builds"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{ name = "Mat McGowan" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Embedded Systems",
+]
+
+[project.scripts]
+pio-lock = "pio_lock:main"
+
+[project.urls]
+Repository = "https://github.com/m-mcgowan/pio-lock"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools]
+py-modules = ["pio_lock"]
+
+# ── Testing ──────────────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: requires PlatformIO CLI (deselect with -m 'not integration')",
+]
+
+# ── Coverage ─────────────────────────────────────────────────────────────────
+
+[tool.coverage.run]
+source = ["pio_lock"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+skip_empty = true
+
+# ── Linting ──────────────────────────────────────────────────────────────────
+
+[tool.ruff]
+target-version = "py38"
+line-length = 99
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "UP007",  # Use X | Y for union (need 3.8 compat in annotations at runtime)
+    "UP045",  # Use X | None (same — needs 3.10+)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pio_lock"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

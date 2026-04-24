@@ -1,0 +1,5 @@
+{
+  "native": [
+    {"name": "NimBLE-Arduino", "type": "registry", "version": "2.1.0", "owner": "h2zero"}
+  ]
+}

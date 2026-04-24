@@ -1,0 +1,5 @@
+{
+  "native": [
+    {"name": "SparkFun MAX1704x Fuel Gauge Arduino Library", "type": "registry", "version": "1.0.4", "owner": "sparkfun"}
+  ]
+}

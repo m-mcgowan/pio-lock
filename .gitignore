@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+/.pio/
+/pio.lock.json
+# Allow .pio dirs inside test fixtures (they contain test state, not real builds)
+!tests/fixtures/**/.pio/
+htmlcov/
+reports/
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+# Also ignore generated lockfiles inside fixtures
+tests/fixtures/*/pio.lock.json

@@ -1,0 +1,6 @@
+{
+  "native": [
+    {"name": "doctest", "type": "registry", "version": "2.4.11", "owner": "doctest"},
+    {"name": "my-local-lib", "type": "local", "path": "file://lib/my-local-lib"}
+  ]
+}

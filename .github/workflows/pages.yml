@@ -1,0 +1,80 @@
+name: Deploy Reports to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build-reports:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pytest pytest-cov
+
+      - name: Run tests with coverage
+        run: >
+          pytest -m "not integration" -v
+          --tb=short
+          --junitxml=_site/reports/junit.xml
+          --cov=pio_lock
+          --cov-report=term-missing
+          --cov-report=html:_site/coverage
+
+      - name: Generate index page
+        run: |
+          COV_PCT=$(python -m coverage report --skip-empty 2>/dev/null | tail -1 | awk '{print $NF}')
+          cat > _site/index.html <<EOF
+          <!DOCTYPE html>
+          <html>
+          <head><title>pio-lock reports</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
+            a { color: #0366d6; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+            .badge { display: inline-block; padding: 4px 8px; border-radius: 4px; font-weight: bold; color: white; background: #28a745; }
+          </style>
+          </head>
+          <body>
+            <h1>pio-lock</h1>
+            <p>Test and coverage reports for <a href="https://github.com/m-mcgowan/pio-lock">m-mcgowan/pio-lock</a></p>
+            <h2>Reports</h2>
+            <ul>
+              <li><a href="coverage/">Coverage Report</a> <span class="badge">${COV_PCT}</span></li>
+              <li><a href="reports/junit.xml">JUnit XML</a></li>
+            </ul>
+            <p><small>Updated on each push to main.</small></p>
+          </body>
+          </html>
+          EOF
+
+      - name: Upload pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build-reports
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
