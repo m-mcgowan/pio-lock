@@ -424,6 +424,34 @@ class TestUpdate:
         assert (tmp_path / "shared.ini.bak").exists()
         assert (tmp_path / "shared.ini.bak").read_text() == extra_content
 
+    def test_update_only_rewrites_lib_deps_block(self, tmp_path, mock_pio):
+        """Spec strings outside lib_deps (e.g. in comments) must be left alone."""
+        ini = (
+            "[env:test]\n"
+            "; reference: acme/Foo @ ^1.0.0  (do not edit this comment)\n"
+            "lib_deps =\n"
+            "    acme/Foo @ ^1.0.0\n"
+            "build_flags = -DFOO=acme/Foo@^1.0.0\n"
+        )
+        (tmp_path / "platformio.ini").write_text(ini)
+        mock_pio.add_lib(
+            "test",
+            "acme/Foo @ ^1.0.0",
+            "Foo",
+            "1.0.0",
+            latest="1.2.0",
+            wanted="1.2.0",
+        )
+        rc = pio_lock.update(tmp_path, ["test"], dry_run=False)
+        assert rc == 0
+        new_ini = (tmp_path / "platformio.ini").read_text()
+        # Comment must be untouched
+        assert "; reference: acme/Foo @ ^1.0.0  (do not edit this comment)" in new_ini
+        # build_flags occurrence must be untouched (not in lib_deps block)
+        assert "-DFOO=acme/Foo@^1.0.0" in new_ini
+        # lib_deps must be updated
+        assert "    acme/Foo @ ^1.2.0\n" in new_ini
+
 
 # ── Tests for ConfigSourceTracker ─────────────────────────────────────────────
 
@@ -924,3 +952,53 @@ class TestParseVersionTuple:
 
     def test_empty(self):
         assert pio_lock._parse_version_tuple("") is None
+
+    def test_prerelease_suffix_dash(self):
+        """`54.03.20-rc1` should parse to the numeric prefix, not return None."""
+        assert pio_lock._parse_version_tuple("54.03.20-rc1") == (54, 3, 20)
+
+    def test_prerelease_suffix_dot(self):
+        assert pio_lock._parse_version_tuple("v2.0.0.beta1") == (2, 0, 0)
+
+
+class TestCheckPlatformCrossMajor:
+    """Cross-major platform releases must surface as a distinct status."""
+
+    def test_higher_major_only_reports_major_update_available(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            pio_lock,
+            "get_platform_url",
+            lambda _d, _e: (
+                "https://github.com/pioarduino/platform-espressif32/releases/"
+                "download/55.03.36/platform-espressif32.zip"
+            ),
+        )
+        github = FakeGitHubClient(
+            {
+                "repos/pioarduino/platform-espressif32/releases?per_page=50": [
+                    {"tag_name": "56.0.0", "draft": False, "prerelease": False},
+                    {"tag_name": "55.03.36", "draft": False, "prerelease": False},
+                ],
+            }
+        )
+        result = pio_lock._check_platform(tmp_path, "test", github)
+        assert result is not None
+        assert result["status"] == "major_update_available"
+        assert result.get("latest_major") == "56.0.0"
+
+
+class TestCheckTagDepPrerelease:
+    """Stable tag pins must not be advanced to a pre-release tag."""
+
+    def test_stable_not_promoted_to_prerelease(self):
+        github = FakeGitHubClient(
+            {
+                "repos/owner/repo/tags?per_page=100": [
+                    {"name": "v2.0.0-rc1", "commit": {"sha": "aaa"}},
+                    {"name": "v1.0.0", "commit": {"sha": "bbb"}},
+                ],
+            }
+        )
+        result = pio_lock._check_tag_dep("owner", "repo", "v1.0.0", "lib", github)
+        assert result is not None
+        assert result["status"] == "up_to_date"

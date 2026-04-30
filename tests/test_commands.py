@@ -325,6 +325,31 @@ class TestRestore:
         rc = pio_lock.restore(tmp_project, ["testenv"])
         assert rc == 1
 
+    def test_restore_does_not_skip_dependencies(
+        self,
+        tmp_project,
+        mock_git_commands,
+    ):
+        """`pio pkg install` must install transitive deps so a clean env builds.
+
+        Passing --skip-dependencies prevents PIO from resolving transitive
+        deps of locked libs, which breaks `lock-restore` on a fresh checkout.
+        """
+        libdeps = tmp_project / ".pio" / "libdeps" / "testenv"
+        libdeps.mkdir(parents=True)
+        write_lockfile(
+            tmp_project,
+            {
+                "testenv": [
+                    {"name": "NewLib", "type": "registry", "version": "3.0.0", "owner": "acme"},
+                ],
+            },
+        )
+        pio_lock.restore(tmp_project, ["testenv"])
+        install_calls = [c for c in mock_git_commands if c[:3] == ["pio", "pkg", "install"]]
+        assert len(install_calls) == 1
+        assert "--skip-dependencies" not in install_calls[0]
+
 
 class TestLibInstallSpec:
     """Tests for _lib_install_spec."""

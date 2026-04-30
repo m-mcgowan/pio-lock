@@ -277,3 +277,31 @@ class TestSnapshotCLI:
         pio_lock.generate_snapshot(snapshot_project)
         rc = pio_lock.main(["-d", str(snapshot_project), "snapshot-print"])
         assert rc == 0
+
+
+class TestAtomicWriteJson:
+    """Snapshot/lockfile writes must not leave a corrupt file on interruption."""
+
+    def test_writes_valid_json(self, tmp_path: Path):
+        path = tmp_path / "out.json"
+        pio_lock._atomic_write_json(path, {"a": 1, "b": [2, 3]})
+        assert json.loads(path.read_text()) == {"a": 1, "b": [2, 3]}
+
+    def test_failure_leaves_no_partial_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """If the rename step fails, the destination file must not exist or
+        retain its prior contents — the temp file must be cleaned up."""
+        path = tmp_path / "out.json"
+        path.write_text('{"old": true}\n')
+        original = path.read_text()
+
+        def boom(*_a, **_kw):
+            raise OSError("simulated rename failure")
+
+        monkeypatch.setattr(os, "replace", boom)
+        with pytest.raises(OSError):
+            pio_lock._atomic_write_json(path, {"new": True})
+        # Pre-existing file content is preserved (no truncation)
+        assert path.read_text() == original
+        # No leftover .tmp files in the parent dir
+        leftovers = [p for p in tmp_path.iterdir() if p.name.startswith("out.json.tmp")]
+        assert leftovers == []

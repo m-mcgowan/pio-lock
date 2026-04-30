@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import contextlib
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +42,30 @@ GLOBAL_PACKAGE_PREFIXES = (
     "tool-ninja",
     "tool-scons",
 )
+
+
+# ── File helpers ─────────────────────────────────────────────────────────────
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write JSON to ``path`` atomically: temp file in the same dir, fsync, rename.
+
+    On any failure the temp file is removed and the original ``path`` is left
+    untouched, so an interrupted write can never leave a half-written JSON file.
+    """
+    json_str = json.dumps(data, indent=2) + "\n"
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".tmp")
+    try:
+        os.write(fd, json_str.encode("utf-8"))
+        os.fsync(fd)
+        os.close(fd)
+        os.replace(tmp_path, path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
 
 
 # ── Shell helpers (mockable seam) ────────────────────────────────────────────
@@ -126,7 +152,7 @@ def generate_snapshot(project_dir: Path, *, pinned: bool = False) -> dict[str, A
         print("WARNING: Working tree has uncommitted changes", file=sys.stderr)
 
     path = project_dir / SNAPSHOT_NAME
-    path.write_text(json.dumps(snapshot, indent=2) + "\n")
+    _atomic_write_json(path, snapshot)
     dirty_marker = "*" if dirty else ""
     print(f"Build snapshot generated: {snapshot['build_date']} (commit {commit}{dirty_marker})")
     return snapshot
@@ -487,7 +513,7 @@ def capture(
 
     dest = output_path or (project_dir / LOCKFILE_NAME)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(json.dumps(lockdata, indent=2) + "\n")
+    _atomic_write_json(dest, lockdata)
     print(f"Wrote {dest}")
     return 0
 
@@ -538,7 +564,6 @@ def restore(project_dir: Path, envs: list[str]) -> int:
                         "--library",
                         spec,
                         "--no-save",
-                        "--skip-dependencies",
                     ],
                     cwd=str(project_dir),
                 )
@@ -856,12 +881,28 @@ def _check_sha_dep(
     }
 
 
+_VERSION_NUMERIC_RE = re.compile(r"^v?(\d+(?:\.\d+)*)(?:[-+_.].*)?$")
+_PRERELEASE_SUFFIX_RE = re.compile(
+    r"[-_.](?:rc|alpha|beta|dev|pre|nightly)(?:\d|[-._]|$)", re.IGNORECASE
+)
+
+
 def _parse_version_tuple(tag: str) -> Optional[tuple[int, ...]]:
-    """Parse a version tag like 'v2.0.0' or '4.2.1' into a comparable tuple."""
-    match = re.match(r"^v?(\d+(?:\.\d+)*)$", tag)
+    """Parse the leading numeric version of a tag into a comparable tuple.
+
+    Accepts plain releases (``2.0.0``, ``v1.2``) and tags carrying a pre-release
+    or build suffix (``54.03.20-rc1``, ``v2.0.0+build5``). Returns ``None`` if no
+    leading numeric version can be extracted.
+    """
+    match = _VERSION_NUMERIC_RE.match(tag)
     if not match:
         return None
     return tuple(int(x) for x in match.group(1).split("."))
+
+
+def _is_prerelease_tag(tag: str) -> bool:
+    """Return True if a tag carries a pre-release suffix (rc/alpha/beta/...)."""
+    return bool(_PRERELEASE_SUFFIX_RE.search(tag))
 
 
 def _check_tag_dep(
@@ -873,6 +914,7 @@ def _check_tag_dep(
         return None
 
     has_v_prefix = tag.startswith("v")
+    current_is_prerelease = _is_prerelease_tag(tag)
 
     # Fetch tags (first page, up to 100)
     tags = github.get_json(f"repos/{owner}/{repo}/tags?per_page=100")
@@ -888,6 +930,9 @@ def _check_tag_dep(
             continue
         # Must match prefix convention
         if has_v_prefix != tag_name.startswith("v"):
+            continue
+        # Don't promote a stable pin onto a pre-release tag
+        if not current_is_prerelease and _is_prerelease_tag(tag_name):
             continue
         if ver > current_ver:
             newer.append((ver, tag_name))
@@ -935,7 +980,13 @@ def _check_git_deps(entries: list[dict[str, Any]], github: GitHubClient) -> list
 def _check_platform(
     project_dir: Path, env_name: str, github: GitHubClient
 ) -> Optional[dict[str, Any]]:
-    """Check if a newer platform release is available on GitHub."""
+    """Check if a newer platform release is available on GitHub.
+
+    Reports separately:
+      - ``outdated``: a newer release within the same major exists
+      - ``major_update_available``: only a higher-major release is newer
+      - ``up_to_date``: current is the highest matching tag
+    """
     platform_url = get_platform_url(project_dir, env_name)
     if platform_url == "unknown":
         return None
@@ -953,8 +1004,10 @@ def _check_platform(
     if not releases or not isinstance(releases, list):
         return None
 
-    # Find newer releases matching the same major version prefix
-    newer = []
+    current_is_prerelease = _is_prerelease_tag(current_version)
+    same_major: list[tuple[tuple[int, ...], str]] = []
+    higher_major: list[tuple[tuple[int, ...], str]] = []
+
     for rel in releases:
         tag = rel.get("tag_name", "")
         if rel.get("draft") or rel.get("prerelease"):
@@ -962,27 +1015,50 @@ def _check_platform(
         ver = _parse_version_tuple(tag)
         if ver is None:
             continue
-        # Match same major version prefix (e.g. 55.x.y)
-        if ver and current_ver and ver[0] == current_ver[0] and ver > current_ver:
-            newer.append((ver, tag))
+        if not current_is_prerelease and _is_prerelease_tag(tag):
+            continue
+        if ver <= current_ver:
+            continue
+        if ver[0] == current_ver[0]:
+            same_major.append((ver, tag))
+        else:
+            higher_major.append((ver, tag))
 
-    if not newer:
+    if same_major:
+        same_major.sort(reverse=True)
+        latest_tag = same_major[0][1]
+        extra = ""
+        if higher_major:
+            higher_major.sort(reverse=True)
+            extra = f" (cross-major {higher_major[0][1]} also available)"
         return {
             "name": repo,
             "current": current_version,
-            "status": "up_to_date",
-            "message": "latest release",
+            "status": "outdated",
+            "latest": latest_tag,
+            "latest_major": higher_major[0][1] if higher_major else None,
+            "message": f"{current_version} → {latest_tag} available{extra}",
         }
 
-    newer.sort(reverse=True)
-    latest_tag = newer[0][1]
+    if higher_major:
+        higher_major.sort(reverse=True)
+        latest_major_tag = higher_major[0][1]
+        return {
+            "name": repo,
+            "current": current_version,
+            "status": "major_update_available",
+            "latest_major": latest_major_tag,
+            "message": (
+                f"{current_version} → {latest_major_tag} (cross-major update; "
+                "manual review recommended)"
+            ),
+        }
 
     return {
         "name": repo,
         "current": current_version,
-        "status": "outdated",
-        "latest": latest_tag,
-        "message": f"{current_version} → {latest_tag} available",
+        "status": "up_to_date",
+        "message": "latest release",
     }
 
 
@@ -1074,7 +1150,10 @@ def outdated(
 
     has_outdated = any(e["is_outdated"] for e in entries)
     has_git_outdated = any(r["status"] == "outdated" for r in git_results)
-    has_platform_outdated = platform_result is not None and platform_result["status"] == "outdated"
+    has_platform_outdated = platform_result is not None and platform_result["status"] in (
+        "outdated",
+        "major_update_available",
+    )
 
     if output_json:
         data: dict[str, Any] = {
@@ -1134,7 +1213,13 @@ def outdated(
     if platform_result:
         print(f"\n{'Platform'}")
         print("-" * 76)
-        marker = " *" if platform_result["status"] == "outdated" else "  "
+        status = platform_result["status"]
+        if status == "outdated":
+            marker = " *"
+        elif status == "major_update_available":
+            marker = "!!"
+        else:
+            marker = "  "
         print(f"{marker}{platform_result['name']:<38} {platform_result['message']}")
 
     if github_skipped_reason:
@@ -1287,7 +1372,13 @@ def update(
         print("\nDry run — no files modified.")
         return 0
 
-    # Apply replacements to each config file
+    # Apply replacements to each config file. Restrict substitutions to
+    # `lib_deps` blocks so identical strings appearing elsewhere (comments,
+    # build_flags, etc.) are not accidentally rewritten.
+    lib_deps_re = re.compile(
+        r"(^[ \t]*lib_deps[ \t]*=)([^\n]*(?:\n[ \t]+[^\n]*)*)",
+        re.MULTILINE,
+    )
     for filepath, specs in replacements.items():
         content = filepath.read_text()
 
@@ -1296,10 +1387,15 @@ def update(
         backup_path.write_text(content)
         print(f"\nBackup: {backup_path}")
 
-        for old_spec, new_spec in specs:
-            content = content.replace(old_spec, new_spec)
+        def _rewrite_block(match: re.Match[str], specs=specs) -> str:
+            head, body = match.group(1), match.group(2)
+            for old_spec, new_spec in specs:
+                body = body.replace(old_spec, new_spec)
+            return head + body
 
-        filepath.write_text(content)
+        new_content = lib_deps_re.sub(_rewrite_block, content)
+
+        filepath.write_text(new_content)
         print(f"Updated: {filepath}")
 
     print("\nRun `pio pkg install` then `pio-lock capture` to lock the new versions.")
