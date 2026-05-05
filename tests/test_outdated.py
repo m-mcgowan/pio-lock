@@ -452,6 +452,86 @@ class TestUpdate:
         # lib_deps must be updated
         assert "    acme/Foo @ ^1.2.0\n" in new_ini
 
+    def test_update_lib_deps_inline_form(self, tmp_path, mock_pio):
+        """`lib_deps = spec` on a single line is rewritten correctly."""
+        ini = "[env:test]\nlib_deps = acme/Foo @ ^1.0.0\nbuild_flags = -O2\n"
+        (tmp_path / "platformio.ini").write_text(ini)
+        mock_pio.add_lib(
+            "test",
+            "acme/Foo @ ^1.0.0",
+            "Foo",
+            "1.0.0",
+            latest="1.2.0",
+            wanted="1.2.0",
+        )
+        pio_lock.update(tmp_path, ["test"], dry_run=False)
+        new_ini = (tmp_path / "platformio.ini").read_text()
+        assert "lib_deps = acme/Foo @ ^1.2.0\n" in new_ini
+        assert "build_flags = -O2\n" in new_ini
+
+    def test_update_lib_deps_with_options_around_it(self, tmp_path, mock_pio):
+        """A `lib_deps` block with options before AND after is bounded correctly.
+
+        The regex must stop at the next un-indented line, not consume the
+        following options into the block body.
+        """
+        ini = (
+            "[env:test]\n"
+            "build_type = release\n"
+            "lib_deps =\n"
+            "    acme/Foo @ ^1.0.0\n"
+            "upload_speed = 921600\n"
+            "monitor_speed = 115200\n"
+        )
+        (tmp_path / "platformio.ini").write_text(ini)
+        mock_pio.add_lib(
+            "test",
+            "acme/Foo @ ^1.0.0",
+            "Foo",
+            "1.0.0",
+            latest="1.2.0",
+            wanted="1.2.0",
+        )
+        pio_lock.update(tmp_path, ["test"], dry_run=False)
+        new_ini = (tmp_path / "platformio.ini").read_text()
+        assert "build_type = release\n" in new_ini
+        assert "upload_speed = 921600\n" in new_ini
+        assert "monitor_speed = 115200\n" in new_ini
+        assert "    acme/Foo @ ^1.2.0\n" in new_ini
+
+    def test_update_same_spec_in_two_envs(self, tmp_path, mock_pio):
+        """The same spec declared in two envs' lib_deps must be rewritten in both."""
+        ini = (
+            "[env:dev]\n"
+            "lib_deps =\n"
+            "    acme/Foo @ ^1.0.0\n"
+            "[env:prod]\n"
+            "lib_deps =\n"
+            "    acme/Foo @ ^1.0.0\n"
+        )
+        (tmp_path / "platformio.ini").write_text(ini)
+        mock_pio.add_lib(
+            "dev",
+            "acme/Foo @ ^1.0.0",
+            "Foo",
+            "1.0.0",
+            latest="1.2.0",
+            wanted="1.2.0",
+        )
+        # Same spec for prod env
+        mock_pio.add_lib(
+            "prod",
+            "acme/Foo @ ^1.0.0",
+            "Foo",
+            "1.0.0",
+            latest="1.2.0",
+            wanted="1.2.0",
+        )
+        pio_lock.update(tmp_path, ["dev", "prod"], dry_run=False)
+        new_ini = (tmp_path / "platformio.ini").read_text()
+        assert new_ini.count("acme/Foo @ ^1.2.0") == 2
+        assert "acme/Foo @ ^1.0.0" not in new_ini
+
 
 # ── Tests for ConfigSourceTracker ─────────────────────────────────────────────
 
@@ -959,6 +1039,99 @@ class TestParseVersionTuple:
 
     def test_prerelease_suffix_dot(self):
         assert pio_lock._parse_version_tuple("v2.0.0.beta1") == (2, 0, 0)
+
+
+# Realistic GitHub tag strings from real-world projects (pioarduino,
+# espressif/esp-idf, blues/note-arduino, h2zero/NimBLE-Arduino, …) — used
+# to exercise both the version parser and the prerelease classifier
+# against the kinds of strings actually published in the wild.
+_REAL_TAG_FIXTURES: list[tuple[str, Optional[tuple[int, ...]], bool]] = [
+    # (tag, expected version tuple, expected is_prerelease)
+    ("55.03.37", (55, 3, 37), False),
+    ("v55.03.37", (55, 3, 37), False),
+    ("54.03.20-rc1", (54, 3, 20), True),
+    ("v2.0.0-rc.1", (2, 0, 0), True),
+    ("v3.0.0-beta.2", (3, 0, 0), True),
+    ("1.4.1", (1, 4, 1), False),
+    ("v5.5.0", (5, 5, 0), False),
+    ("v5.5.0-dev-99-g0a1b2c3", (5, 5, 0), True),
+    ("0.9.0-alpha", (0, 9, 0), True),
+    ("v1.0.0-pre", (1, 0, 0), True),
+    ("v2024.11.01", (2024, 11, 1), False),
+    # Tag strings that should NOT parse as a version
+    ("latest", None, False),
+    ("HEAD", None, False),
+    ("refs/heads/main", None, False),
+    ("release-candidate", None, False),
+    ("", None, False),
+]
+
+
+class TestParseVersionTupleRealWorld:
+    """Parametrized: parser + prerelease classifier against real GitHub tags."""
+
+    @pytest.mark.parametrize("tag,expected,_is_pre", _REAL_TAG_FIXTURES)
+    def test_parses_to_expected_tuple(self, tag, expected, _is_pre):
+        assert pio_lock._parse_version_tuple(tag) == expected
+
+    @pytest.mark.parametrize("tag,_expected,is_pre", _REAL_TAG_FIXTURES)
+    def test_classifies_prerelease(self, tag, _expected, is_pre):
+        assert pio_lock._is_prerelease_tag(tag) == is_pre
+
+
+class TestCheckTagDepRealWorld:
+    """`_check_tag_dep` against realistic mixed-tag GitHub responses."""
+
+    def test_picks_highest_stable_skipping_prereleases(self):
+        """When current is stable, latest stable wins even if a higher RC exists."""
+        github = FakeGitHubClient(
+            {
+                "repos/pioarduino/platform-espressif32/tags?per_page=100": [
+                    {"name": "55.03.37", "commit": {"sha": "aaa"}},
+                    {"name": "55.03.38-rc1", "commit": {"sha": "bbb"}},
+                    {"name": "55.03.36", "commit": {"sha": "ccc"}},
+                ],
+            }
+        )
+        result = pio_lock._check_tag_dep(
+            "pioarduino", "platform-espressif32", "55.03.36", "esp32", github
+        )
+        assert result is not None
+        assert result["status"] == "outdated"
+        assert result["latest_tag"] == "55.03.37"
+
+    def test_v_prefix_required_to_match_v_prefix(self):
+        """A `v`-prefixed pin must not match unprefixed tags and vice versa."""
+        github = FakeGitHubClient(
+            {
+                "repos/h2zero/NimBLE-Arduino/tags?per_page=100": [
+                    {"name": "1.4.2", "commit": {"sha": "aaa"}},
+                    {"name": "1.4.3", "commit": {"sha": "bbb"}},
+                ],
+            }
+        )
+        # Pin without v-prefix → should match unprefixed tags
+        result = pio_lock._check_tag_dep(
+            "h2zero", "NimBLE-Arduino", "1.4.1", "NimBLE-Arduino", github
+        )
+        assert result is not None
+        assert result["status"] == "outdated"
+        assert result["latest_tag"] == "1.4.3"
+
+    def test_prerelease_pin_can_advance_to_newer_prerelease(self):
+        """If current pin is itself a prerelease, newer prereleases are valid candidates."""
+        github = FakeGitHubClient(
+            {
+                "repos/owner/repo/tags?per_page=100": [
+                    {"name": "v2.0.0-rc1", "commit": {"sha": "aaa"}},
+                    {"name": "v2.0.0-rc2", "commit": {"sha": "bbb"}},
+                ],
+            }
+        )
+        result = pio_lock._check_tag_dep("owner", "repo", "v2.0.0-rc1", "lib", github)
+        assert result is not None
+        assert result["status"] == "outdated"
+        assert result["latest_tag"] == "v2.0.0-rc2"
 
 
 class TestCheckPlatformCrossMajor:

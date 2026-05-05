@@ -1,0 +1,8 @@
+{
+  "dev": [
+    {"name": "Lib1", "type": "registry", "version": "1.0.0", "owner": "acme"}
+  ],
+  "prod": [
+    {"name": "Lib1", "type": "registry", "version": "1.0.0", "owner": "acme"}
+  ]
+}

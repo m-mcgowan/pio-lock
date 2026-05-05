@@ -905,16 +905,33 @@ def _is_prerelease_tag(tag: str) -> bool:
     return bool(_PRERELEASE_SUFFIX_RE.search(tag))
 
 
+def _version_sort_key(tag: str) -> tuple[tuple[int, ...], int, str]:
+    """Build a sortable key that orders versions correctly across pre-releases.
+
+    Returns ``(numeric_tuple, release_rank, suffix)`` where ``release_rank`` is
+    0 for stable releases and -1 for pre-releases (so ``rc1 < stable``), and
+    ``suffix`` is the raw post-numeric portion (so ``rc1 < rc2``). Tuples sort
+    lexicographically, giving the intended order:
+
+      v2.0.0-rc1 < v2.0.0-rc2 < v2.0.0
+    """
+    numeric = _parse_version_tuple(tag) or ()
+    rank = -1 if _is_prerelease_tag(tag) else 0
+    # Strip the leading numeric portion (and any v-prefix) to isolate the suffix
+    suffix = re.sub(r"^v?\d+(?:\.\d+)*", "", tag)
+    return numeric, rank, suffix
+
+
 def _check_tag_dep(
     owner: str, repo: str, tag: str, name: str, github: GitHubClient
 ) -> Optional[dict[str, Any]]:
     """Check a tag-pinned dep: find newer tags with the same naming convention."""
-    current_ver = _parse_version_tuple(tag)
-    if current_ver is None:
+    if _parse_version_tuple(tag) is None:
         return None
 
     has_v_prefix = tag.startswith("v")
     current_is_prerelease = _is_prerelease_tag(tag)
+    current_key = _version_sort_key(tag)
 
     # Fetch tags (first page, up to 100)
     tags = github.get_json(f"repos/{owner}/{repo}/tags?per_page=100")
@@ -925,8 +942,7 @@ def _check_tag_dep(
     newer = []
     for t in tags:
         tag_name = t["name"]
-        ver = _parse_version_tuple(tag_name)
-        if ver is None:
+        if _parse_version_tuple(tag_name) is None:
             continue
         # Must match prefix convention
         if has_v_prefix != tag_name.startswith("v"):
@@ -934,8 +950,9 @@ def _check_tag_dep(
         # Don't promote a stable pin onto a pre-release tag
         if not current_is_prerelease and _is_prerelease_tag(tag_name):
             continue
-        if ver > current_ver:
-            newer.append((ver, tag_name))
+        key = _version_sort_key(tag_name)
+        if key > current_key:
+            newer.append((key, tag_name))
 
     if not newer:
         return {
@@ -999,14 +1016,16 @@ def _check_platform(
     current_ver = _parse_version_tuple(current_version)
     if current_ver is None:
         return None
+    current_major = current_ver[0]
 
     releases = github.get_json(f"repos/{owner}/{repo}/releases?per_page=50")
     if not releases or not isinstance(releases, list):
         return None
 
     current_is_prerelease = _is_prerelease_tag(current_version)
-    same_major: list[tuple[tuple[int, ...], str]] = []
-    higher_major: list[tuple[tuple[int, ...], str]] = []
+    current_key = _version_sort_key(current_version)
+    same_major: list[tuple[Any, str]] = []
+    higher_major: list[tuple[Any, str]] = []
 
     for rel in releases:
         tag = rel.get("tag_name", "")
@@ -1017,12 +1036,13 @@ def _check_platform(
             continue
         if not current_is_prerelease and _is_prerelease_tag(tag):
             continue
-        if ver <= current_ver:
+        key = _version_sort_key(tag)
+        if key <= current_key:
             continue
-        if ver[0] == current_ver[0]:
-            same_major.append((ver, tag))
+        if ver[0] == current_major:
+            same_major.append((key, tag))
         else:
-            higher_major.append((ver, tag))
+            higher_major.append((key, tag))
 
     if same_major:
         same_major.sort(reverse=True)

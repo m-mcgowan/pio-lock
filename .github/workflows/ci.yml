@@ -52,6 +52,7 @@ jobs:
           --junitxml=reports/junit.xml
           --cov=pio_lock
           --cov-report=term-missing
+          --cov-fail-under=80
 
       - name: Test summary
         if: always()
@@ -109,6 +110,7 @@ jobs:
           --cov=pio_lock
           --cov-report=term-missing
           --cov-report=html:reports/htmlcov
+          --cov-fail-under=80
 
       - name: Test summary
         if: always()

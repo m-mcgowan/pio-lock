@@ -350,6 +350,83 @@ class TestRestore:
         assert len(install_calls) == 1
         assert "--skip-dependencies" not in install_calls[0]
 
+    def test_restore_registry_argv_is_pinned(
+        self,
+        tmp_project,
+        mock_git_commands,
+    ):
+        """The exact argv passed to `pio pkg install` for a registry lib.
+
+        Pinning this catches accidental flag drift (e.g. someone re-adding
+        --skip-dependencies, or dropping --no-save) at PR review time.
+        """
+        libdeps = tmp_project / ".pio" / "libdeps" / "testenv"
+        libdeps.mkdir(parents=True)
+        write_lockfile(
+            tmp_project,
+            {
+                "testenv": [
+                    {"name": "NewLib", "type": "registry", "version": "3.0.0", "owner": "acme"},
+                ],
+            },
+        )
+        pio_lock.restore(tmp_project, ["testenv"])
+        install_calls = [c for c in mock_git_commands if c[:3] == ["pio", "pkg", "install"]]
+        assert install_calls == [
+            [
+                "pio",
+                "pkg",
+                "install",
+                "-d",
+                str(tmp_project),
+                "-e",
+                "testenv",
+                "--library",
+                "acme/NewLib @ ==3.0.0",
+                "--no-save",
+            ]
+        ]
+
+    def test_restore_git_argv_is_pinned(
+        self,
+        tmp_project,
+        mock_git_commands,
+    ):
+        """The exact argv passed to `pio pkg install` for a git lib."""
+        libdeps = tmp_project / ".pio" / "libdeps" / "testenv"
+        libdeps.mkdir(parents=True)
+        write_lockfile(
+            tmp_project,
+            {
+                "testenv": [
+                    {
+                        "name": "GitDep",
+                        "type": "git",
+                        "url": "https://github.com/test/dep.git",
+                        "sha": "deadbeef",
+                    },
+                ],
+            },
+        )
+        pio_lock.restore(tmp_project, ["testenv"])
+        install_calls = [c for c in mock_git_commands if c[:3] == ["pio", "pkg", "install"]]
+        assert install_calls == [
+            [
+                "pio",
+                "pkg",
+                "install",
+                "-d",
+                str(tmp_project),
+                "-e",
+                "testenv",
+                "--library",
+                "https://github.com/test/dep.git#deadbeef",
+                "--no-save",
+            ]
+        ]
+        assert len(install_calls) == 1
+        assert "--skip-dependencies" not in install_calls[0]
+
 
 class TestLibInstallSpec:
     """Tests for _lib_install_spec."""

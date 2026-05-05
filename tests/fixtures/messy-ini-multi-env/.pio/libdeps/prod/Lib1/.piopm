@@ -1,0 +1,1 @@
+{"type": "library", "name": "Lib1", "version": "1.0.0", "spec": {"owner": "acme", "id": 1, "name": "Lib1", "requirements": "^1.0.0", "uri": null}}
