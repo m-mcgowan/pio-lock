@@ -1,0 +1,9 @@
+{
+    "name": "pio-lock",
+    "version": "0.2.0",
+    "descriotion": "PlatformIO dependency lockfile tool for reproducible builds",
+    "keywords": "lock build",
+    "build": {
+        "extraScript": "pio_lock.py"
+    }
+}

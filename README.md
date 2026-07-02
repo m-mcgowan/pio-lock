@@ -73,9 +73,6 @@ Add `pio-lock` as a library dependency and reference its script:
 [env:myenv]
 lib_deps =
     https://github.com/m-mcgowan/pio-lock.git
-
-extra_scripts =
-    pre:${PROJECT_LIBDEPS_DIR}/${PIOENV}/pio-lock/pio_lock.py
 ```
 
 PlatformIO downloads pio-lock into `.pio/libdeps/<env>/` and the
