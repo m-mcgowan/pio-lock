@@ -109,6 +109,13 @@ def get_git_commit(project_dir: Path) -> str:
         return "unknown"
 
 
+def get_git_branch(project_dir: Path) ->str:
+    try:
+        return run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(project_dir))
+    except subprocess.CalledProcessError:
+        return "unknown"
+
+
 def is_git_dirty(project_dir: Path) -> bool:
     """Check if the working tree has uncommitted changes."""
     try:
@@ -411,6 +418,7 @@ def _scan_single_library(lib_dir: Path, name: str) -> Optional[dict[str, Any]]:
     elif (lib_dir / ".git").exists() or (lib_dir / ".git").is_file():
         sha = get_git_sha(lib_dir)
         url = get_git_remote_url(lib_dir)
+        branch = get_git_branch(lib_dir)
 
         display_name = name
         lib_json_path = lib_dir / "library.json"
@@ -426,6 +434,7 @@ def _scan_single_library(lib_dir: Path, name: str) -> Optional[dict[str, Any]]:
             "type": "git",
             "url": url,
             "sha": sha,
+            "branch": branch,
         }
     else:
         print(
