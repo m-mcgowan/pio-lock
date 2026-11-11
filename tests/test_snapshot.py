@@ -409,3 +409,32 @@ class TestEpochSourceStaleness:
         self._write(snapshot_project, epoch_source="commit", source_date_epoch=COMMIT_EPOCH)
         pio_lock.snapshot_auto_manage(snapshot_project)
         assert os.environ["SOURCE_DATE_EPOCH"] == "1800000000"
+
+
+class TestEpochSourceReporting:
+    def _write_old_format(self, project: Path) -> None:
+        data = {
+            "source_date_epoch": 1700000000,
+            "build_date": "2023-11-14T22:13:20+00:00",
+            "git_commit": "abc12345",
+        }
+        (project / pio_lock.SNAPSHOT_NAME).write_text(json.dumps(data))
+
+    def test_check_reports_an_old_format_snapshot_as_stale(self, snapshot_project, capsys):
+        self._write_old_format(snapshot_project)
+        assert pio_lock.snapshot_check(snapshot_project) == 1
+        assert "STALE" in capsys.readouterr().out
+
+    def test_release_error_names_the_epoch_source_not_two_equal_shas(
+        self, snapshot_project, monkeypatch, capsys
+    ):
+        monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
+        self._write_old_format(snapshot_project)
+        fake_env = FakePioEnv()
+        pio_lock.snapshot_auto_manage(snapshot_project, fake_env)
+        err = capsys.readouterr().err
+        assert fake_env.exit_code == 1
+        assert "epoch source is time" in err
+        assert "the tree is clean" in err
+        assert "snapshot-capture" in err
+        assert "Snapshot commit" not in err

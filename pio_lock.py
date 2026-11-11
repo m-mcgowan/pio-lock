@@ -202,7 +202,11 @@ def is_snapshot_stale(snapshot: dict[str, Any], project_dir: Path) -> bool:
 
 
 def apply_snapshot(snapshot: dict[str, Any]) -> None:
-    """Set SOURCE_DATE_EPOCH from the snapshot."""
+    """Set SOURCE_DATE_EPOCH from the snapshot.
+
+    This overrides any SOURCE_DATE_EPOCH already in the environment: the snapshot is the
+    build's single source for the epoch.
+    """
     epoch = str(snapshot["source_date_epoch"])
     os.environ["SOURCE_DATE_EPOCH"] = epoch
     build_date = snapshot.get("build_date", "unknown")
@@ -237,9 +241,16 @@ def snapshot_auto_manage(project_dir: Path, env: Any = None) -> None:
     elif is_snapshot_stale(snapshot, project_dir):
         if release:
             head = get_git_commit(project_dir)
+            if snapshot.get("git_commit") == head:
+                tree = "dirty" if is_git_dirty(project_dir) else "clean"
+                detail = (
+                    f"the snapshot's epoch source is {snapshot.get('epoch_source', 'time')}; "
+                    f"the tree is {tree}: rerun snapshot-capture"
+                )
+            else:
+                detail = f"Snapshot commit: {snapshot.get('git_commit')}, HEAD: {head}"
             print(
-                f"ERROR: {SNAPSHOT_NAME} is stale in release mode. "
-                f"Snapshot commit: {snapshot.get('git_commit')}, HEAD: {head}",
+                f"ERROR: {SNAPSHOT_NAME} is stale in release mode. {detail}",
                 file=sys.stderr,
             )
             if env:
@@ -287,7 +298,7 @@ def snapshot_check(project_dir: Path) -> int:
     head = get_git_commit(project_dir)
     commit = snapshot.get("git_commit")
     pinned = snapshot.get("pinned", False)
-    stale = head != "unknown" and commit != head
+    stale = is_snapshot_stale(snapshot, project_dir)
 
     print(f"Snapshot: {snapshot.get('build_date', 'unknown')}")
     print(f"  Commit:  {commit} {'(pinned)' if pinned else ''}")

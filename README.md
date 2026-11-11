@@ -184,7 +184,7 @@ Or integrate into an existing cache strategy:
 
 ## What this doesn't solve
 
-- ~~**Bit-for-bit identical binaries** — ESP-IDF embeds timestamps; same source doesn't guarantee identical bytes~~ The build snapshot feature now sets `SOURCE_DATE_EPOCH` to produce deterministic `__DATE__`/`__TIME__` macros, enabling reproducible builds. The epoch is the HEAD commit's time on a clean tree, so the same commit gives the same epoch everywhere
+- ~~**Bit-for-bit identical binaries** — ESP-IDF embeds timestamps; same source doesn't guarantee identical bytes~~ The build snapshot feature now sets `SOURCE_DATE_EPOCH` to produce deterministic `__DATE__`/`__TIME__` macros, enabling reproducible builds. The epoch is the HEAD commit's time on a clean tree, so the same commit gives the same epoch everywhere. The snapshot's epoch overrides any `SOURCE_DATE_EPOCH` already set in the environment
 - **Global toolchain pinning** — Recorded for auditing; the platform URL already pins these in practice
 - **PlatformIO Core version enforcement** — Recorded in lockfile for reference
 

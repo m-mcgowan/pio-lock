@@ -14,6 +14,10 @@ Follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 - Untracked files no longer make the tree dirty.
 - Snapshots record `epoch_source` (`commit` or `time`). A snapshot whose source no longer fits the
   tree (including one written by 0.2.x) is regenerated.
+- The snapshot's epoch overrides any `SOURCE_DATE_EPOCH` already set in the environment.
+- `snapshot-check` applies the same staleness rule as the build, so a 0.2.x snapshot reports STALE.
+  In release mode a snapshot stale only by its epoch source says so, rather than showing two
+  identical commits.
 
 ## [0.2.0] - 2026-05-05
 
