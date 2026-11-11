@@ -5,6 +5,16 @@ Follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-10
+
+### Changed
+- The build snapshot takes `SOURCE_DATE_EPOCH` from the HEAD commit's committer time on a clean
+  tree, so two machines building the same commit stamp the same time. A dirty tree (or no git)
+  falls back to the current time and prints `non-reproducible: ...`.
+- Untracked files no longer make the tree dirty.
+- Snapshots record `epoch_source` (`commit` or `time`). A snapshot whose source no longer fits the
+  tree (including one written by 0.2.x) is regenerated.
+
 ## [0.2.0] - 2026-05-05
 
 ### Fixed

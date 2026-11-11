@@ -11,6 +11,8 @@ import pytest
 
 import pio_lock
 
+COMMIT_EPOCH = 1762790400  # the fake HEAD's commit time (git log -1 --format=%ct)
+
 
 class FakePioEnv:
     """Minimal mock of a PlatformIO SCons environment."""
@@ -37,6 +39,8 @@ def snapshot_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
             return "abc12345"
         if args[:2] == ["git", "status"]:
             return ""  # clean
+        if args[:2] == ["git", "log"]:
+            return str(COMMIT_EPOCH)
         return ""
 
     monkeypatch.setattr(pio_lock, "_run_cmd", fake_run)
@@ -93,7 +97,7 @@ class TestLoadSnapshot:
 
 class TestIsSnapshotStale:
     def test_fresh_when_commit_matches(self, snapshot_project: Path):
-        snapshot = {"git_commit": "abc12345"}
+        snapshot = {"git_commit": "abc12345", "epoch_source": "commit"}
         assert pio_lock.is_snapshot_stale(snapshot, snapshot_project) is False
 
     def test_stale_when_commit_differs(self, snapshot_project: Path):
@@ -146,6 +150,7 @@ class TestSnapshotAutoManage:
             "source_date_epoch": original_epoch,
             "build_date": "2023-11-14T22:13:20+00:00",
             "git_commit": "abc12345",
+            "epoch_source": "commit",
         }
         (snapshot_project / pio_lock.SNAPSHOT_NAME).write_text(json.dumps(data))
         pio_lock.snapshot_auto_manage(snapshot_project)
@@ -305,3 +310,102 @@ class TestAtomicWriteJson:
         # No leftover .tmp files in the parent dir
         leftovers = [p for p in tmp_path.iterdir() if p.name.startswith("out.json.tmp")]
         assert leftovers == []
+
+
+def _fake_git(*, status: str = "", log: str | None = str(COMMIT_EPOCH)):
+    def fake_run(args, cwd=None, check=True):
+        if args[:2] == ["git", "rev-parse"] and "--short" in args:
+            return "abc12345"
+        if args[:2] == ["git", "status"]:
+            return status if "--untracked-files=no" in args else (status or "?? notes.md")
+        if args[:2] == ["git", "log"]:
+            if log is None:
+                raise subprocess.CalledProcessError(128, "git")
+            return log
+        return ""
+
+    return fake_run
+
+
+class TestCommitEpoch:
+    def test_epoch_is_the_commit_time_on_a_clean_tree_and_stable(
+        self,
+        snapshot_project,
+        monkeypatch,
+    ):
+        ticks = [1800000000.0]
+
+        def clock():
+            ticks[0] += 1.0  # each call is a second later
+            return ticks[0]
+
+        monkeypatch.setattr(pio_lock.time, "time", clock)
+        first = pio_lock.generate_snapshot(snapshot_project)
+        second = pio_lock.generate_snapshot(snapshot_project)
+        assert first["source_date_epoch"] == COMMIT_EPOCH
+        assert second["source_date_epoch"] == COMMIT_EPOCH
+        assert first["epoch_source"] == "commit"
+
+    def test_untracked_files_do_not_make_the_tree_dirty(self, snapshot_project, monkeypatch):
+        monkeypatch.setattr(pio_lock, "_run_cmd", _fake_git(status=""))
+        snapshot = pio_lock.generate_snapshot(snapshot_project)
+        assert snapshot["git_dirty"] is False
+        assert snapshot["source_date_epoch"] == COMMIT_EPOCH
+
+    def test_a_dirty_tree_uses_the_current_time_and_says_so(
+        self,
+        snapshot_project,
+        monkeypatch,
+        capsys,
+    ):
+        monkeypatch.setattr(pio_lock, "_run_cmd", _fake_git(status=" M src/main.c"))
+        monkeypatch.setattr(pio_lock.time, "time", lambda: 1800000000.0)
+        snapshot = pio_lock.generate_snapshot(snapshot_project)
+        assert snapshot["source_date_epoch"] == 1800000000
+        assert snapshot["epoch_source"] == "time"
+        assert "non-reproducible: dirty tree" in capsys.readouterr().err
+
+    def test_no_commit_time_uses_the_current_time(self, snapshot_project, monkeypatch, capsys):
+        monkeypatch.setattr(pio_lock, "_run_cmd", _fake_git(log=None))
+        monkeypatch.setattr(pio_lock.time, "time", lambda: 1800000000.0)
+        snapshot = pio_lock.generate_snapshot(snapshot_project)
+        assert snapshot["source_date_epoch"] == 1800000000
+        assert snapshot["epoch_source"] == "time"
+        assert "non-reproducible: no commit time" in capsys.readouterr().err
+
+
+class TestEpochSourceStaleness:
+    def _write(self, project, **fields):
+        data = {
+            "source_date_epoch": 1700000000,
+            "build_date": "2023-11-14T22:13:20+00:00",
+            "git_commit": "abc12345",
+            **fields,
+        }
+        (project / pio_lock.SNAPSHOT_NAME).write_text(json.dumps(data))
+
+    def test_old_format_snapshot_on_the_same_commit_is_regenerated(self, snapshot_project):
+        self._write(snapshot_project)  # written by 0.2.0: no epoch_source, a wall-clock epoch
+        pio_lock.snapshot_auto_manage(snapshot_project)
+        assert os.environ["SOURCE_DATE_EPOCH"] == str(COMMIT_EPOCH)
+
+    def test_a_time_snapshot_is_kept_while_the_tree_stays_dirty(
+        self,
+        snapshot_project,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(pio_lock, "_run_cmd", _fake_git(status=" M src/main.c"))
+        self._write(snapshot_project, epoch_source="time")
+        pio_lock.snapshot_auto_manage(snapshot_project)
+        assert os.environ["SOURCE_DATE_EPOCH"] == "1700000000"  # stable: no rebuild per build
+
+    def test_a_commit_snapshot_is_replaced_when_the_tree_becomes_dirty(
+        self,
+        snapshot_project,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(pio_lock, "_run_cmd", _fake_git(status=" M src/main.c"))
+        monkeypatch.setattr(pio_lock.time, "time", lambda: 1800000000.0)
+        self._write(snapshot_project, epoch_source="commit", source_date_epoch=COMMIT_EPOCH)
+        pio_lock.snapshot_auto_manage(snapshot_project)
+        assert os.environ["SOURCE_DATE_EPOCH"] == "1800000000"

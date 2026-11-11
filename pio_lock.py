@@ -110,12 +110,27 @@ def get_git_commit(project_dir: Path) -> str:
 
 
 def is_git_dirty(project_dir: Path) -> bool:
-    """Check if the working tree has uncommitted changes."""
+    """Check if tracked files have uncommitted changes.
+
+    Untracked files are not in the build's source as committed, so they do not make it dirty.
+    """
     try:
-        status = run_cmd(["git", "status", "--porcelain"], cwd=str(project_dir), check=False)
+        status = run_cmd(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=str(project_dir),
+            check=False,
+        )
         return len(status) > 0
     except subprocess.CalledProcessError:
         return False
+
+
+def get_commit_epoch(project_dir: Path) -> Optional[int]:
+    """The HEAD commit's committer time (Unix seconds), or None outside git."""
+    try:
+        return int(run_cmd(["git", "log", "-1", "--format=%ct"], cwd=str(project_dir)))
+    except (subprocess.CalledProcessError, ValueError):
+        return None
 
 
 # ── Build snapshot ───────────────────────────────────────────────────────────
@@ -136,12 +151,24 @@ def load_snapshot(project_dir: Path) -> Optional[dict[str, Any]]:
 
 def generate_snapshot(project_dir: Path, *, pinned: bool = False) -> dict[str, Any]:
     """Generate a new build snapshot from the current state."""
-    epoch = int(time.time())
     commit = get_git_commit(project_dir)
     dirty = is_git_dirty(project_dir)
+    commit_epoch = None if dirty else get_commit_epoch(project_dir)
+    if commit_epoch is not None:
+        # The same commit gives the same epoch on every machine, so __DATE__/__TIME__ and the
+        # bootloader's description block match between a local build and CI's.
+        epoch, epoch_source = commit_epoch, "commit"
+    else:
+        epoch, epoch_source = int(time.time()), "time"
+        reason = "dirty tree" if dirty else "no commit time"
+        print(
+            f"WARNING: non-reproducible: {reason}; SOURCE_DATE_EPOCH is the current time",
+            file=sys.stderr,
+        )
 
     snapshot: dict[str, Any] = {
         "source_date_epoch": epoch,
+        "epoch_source": epoch_source,
         "build_date": datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat(),
         "git_commit": commit,
         "git_dirty": dirty,
@@ -159,9 +186,19 @@ def generate_snapshot(project_dir: Path, *, pinned: bool = False) -> dict[str, A
 
 
 def is_snapshot_stale(snapshot: dict[str, Any], project_dir: Path) -> bool:
-    """Check if a snapshot's commit doesn't match HEAD."""
+    """True when the snapshot is for another commit, or its epoch source no longer fits the tree.
+
+    A clean tree wants the commit's time; a dirty one keeps one wall-clock time until it is clean
+    again (so a dirty incremental build does not re-stamp every build). A snapshot without
+    epoch_source was written before the epoch came from the commit: treat it as wall-clock.
+    """
     head = get_git_commit(project_dir)
-    return head != "unknown" and snapshot.get("git_commit") != head
+    if head == "unknown":
+        return False
+    if snapshot.get("git_commit") != head:
+        return True
+    wanted = "time" if is_git_dirty(project_dir) else "commit"
+    return bool(snapshot.get("epoch_source", "time") != wanted)
 
 
 def apply_snapshot(snapshot: dict[str, Any]) -> None:
