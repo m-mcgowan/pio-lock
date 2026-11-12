@@ -19,3 +19,4 @@ reports/
 .pio-core-*/
 # Also ignore generated lockfiles inside fixtures
 tests/fixtures/*/pio.lock.json
+tests/fixtures/*/pio.lock.ini

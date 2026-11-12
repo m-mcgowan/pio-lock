@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 
+from pio_lock import PlatformLock
+
 
 @pytest.fixture
 def tmp_project(tmp_path: Path) -> Path:
@@ -149,27 +151,37 @@ def mock_git_commands(monkeypatch: pytest.MonkeyPatch):
     return call_log
 
 
+def espressif32_lock(version: str = "6.6.0") -> PlatformLock:
+    """A registry espressif32 platform lock with no packages."""
+    return PlatformLock(
+        spec="espressif32",
+        platform_packages_spec=[],
+        name="espressif32",
+        version=version,
+        src_url=None,
+        packages=[],
+    )
+
+
 @pytest.fixture
-def make_global_packages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Create fake global packages and point PLATFORMIO_CORE_DIR at them."""
-    packages_dir = tmp_path / "pio_home" / "packages"
-    packages_dir.mkdir(parents=True)
-    monkeypatch.setenv("PLATFORMIO_CORE_DIR", str(tmp_path / "pio_home"))
+def fake_pio(monkeypatch: pytest.MonkeyPatch, mock_git_commands: Any):
+    """Install a FakePioAdapter as pio-lock's adapter; returns an installer."""
+    import pio_lock
+    from tests.fakes import FakePioAdapter
 
-    def _make(name: str, version: str) -> Path:
-        pkg_dir = packages_dir / name
-        pkg_dir.mkdir(parents=True, exist_ok=True)
-        (pkg_dir / "package.json").write_text(json.dumps({"name": name, "version": version}))
-        return pkg_dir
+    def _install(platforms: dict[str, PlatformLock], **kwargs: Any) -> FakePioAdapter:
+        adapter = FakePioAdapter(platforms=platforms, **kwargs)
+        monkeypatch.setattr(pio_lock, "_pio_adapter_factory", lambda: adapter)
+        return adapter
 
-    return _make
+    return _install
 
 
 def write_lockfile(
     project_dir: Path,
     envs: dict[str, list[dict[str, Any]]],
 ) -> Path:
-    """Write a pio.lock.json for testing."""
+    """Write a v1 pio.lock.json (libraries only) for testing."""
     lockdata = {
         "_comment": "test lockfile",
         "generated_at": "2026-01-01T00:00:00Z",

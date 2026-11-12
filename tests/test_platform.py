@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -16,7 +17,13 @@ from typing import Any, ClassVar
 import pytest
 
 import pio_lock
-from pio_lock import PioAdapter, PioIncompatible, PlatformLock, PlatformNotInstalled
+from pio_lock import (
+    PackageLock,
+    PioAdapter,
+    PioIncompatible,
+    PlatformLock,
+    PlatformNotInstalled,
+)
 from tests.fakes import FakePioAdapter
 
 # ── Stub PlatformIO modules ─────────────────────────────────────────────────
@@ -167,7 +174,7 @@ def test_fake_adapter_returns_platform_and_in_use(tmp_project: Path) -> None:
     )
     fake.probe()
     assert fake.core_version() == "6.1.18"
-    assert fake.resolve_platform(tmp_project, "testenv") is lock
+    assert fake.resolve_platform(tmp_project, "testenv") == lock
     assert fake.platform_in_use(tmp_project, "testenv") == ("espressif32", "6.5.0")
 
 
@@ -370,3 +377,241 @@ def test_config_view_expands_project_dir_from_project(tmp_path: Path) -> None:
     assert builtins["PROJECT_HASH"]().startswith(tmp_path.resolve().name + "-")
     assert builtins["UNIX_TIME"] is str
     assert _Config.BUILTIN_VARS["PROJECT_DIR"] is os.getcwd
+
+
+# ── capture: lockfile v2 and pio.lock.ini ────────────────────────────────────
+
+_PIOARDUINO_URL = (
+    "https://github.com/pioarduino/platform-espressif32/releases/download/54.03.20/"
+    "platform-espressif32.zip"
+)
+
+
+def _lock(
+    *,
+    spec: str = "espressif32",
+    name: str = "espressif32",
+    version: str = "6.6.0",
+    src_url: str | None = None,
+    packages: list[PackageLock] | None = None,
+    platform_packages_spec: list[str] | None = None,
+) -> PlatformLock:
+    return PlatformLock(
+        spec=spec,
+        platform_packages_spec=platform_packages_spec or [],
+        name=name,
+        version=version,
+        src_url=src_url,
+        packages=packages or [],
+    )
+
+
+def _read_lock(project: Path) -> dict[str, Any]:
+    return dict(json.loads((project / "pio.lock.json").read_text()))
+
+
+def test_capture_writes_v2_with_platform(tmp_project: Path, fake_pio: Any) -> None:
+    fake_pio({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    data = _read_lock(tmp_project)
+    assert data["lockfile_version"] == 2
+    assert "global_packages" not in data
+    assert "platform_url" not in data
+    assert data["pio_core_version"] == "6.1.18"
+    assert data["envs"]["testenv"]["platform"]["version"] == "6.6.0"
+    assert data["envs"]["testenv"]["platform"]["spec"] == "espressif32"
+    assert data["envs"]["testenv"]["libraries"] == []
+
+
+def test_capture_writes_lock_ini(tmp_project: Path, fake_pio: Any) -> None:
+    fake_pio(
+        {
+            "testenv": _lock(
+                packages=[
+                    PackageLock("toolchain-xtensa-esp32", "8.4.0", owner="espressif"),
+                    PackageLock("tool-esptoolpy", "1.40501.0", owner="platformio"),
+                ]
+            )
+        }
+    )
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    ini = (tmp_project / "pio.lock.ini").read_text()
+    assert "[env:testenv]" in ini
+    assert "platform = platformio/espressif32@6.6.0" in ini
+    assert "  espressif/toolchain-xtensa-esp32@8.4.0\n" in ini
+    assert "  platformio/tool-esptoolpy@1.40501.0\n" in ini
+    assert ini.startswith("#")
+    assert "extra_configs" in ini.split("[env:")[0]
+
+
+def test_capture_writes_lock_ini_next_to_custom_output(tmp_project: Path, fake_pio: Any) -> None:
+    fake_pio({"testenv": _lock()})
+    output = tmp_project / "custom" / "lock.json"
+    assert pio_lock.capture(tmp_project, ["testenv"], output_path=output) == 0
+    assert (tmp_project / "custom" / "pio.lock.ini").exists()
+    assert not (tmp_project / "pio.lock.ini").exists()
+
+
+def test_lock_ini_uses_src_url_for_url_platforms() -> None:
+    lockdata = {
+        "envs": {
+            "esp32": {
+                "platform": asdict(
+                    _lock(spec=_PIOARDUINO_URL, version="54.3.20", src_url=_PIOARDUINO_URL)
+                ),
+                "libraries": [],
+            }
+        }
+    }
+    ini = pio_lock.render_lock_ini(lockdata)
+    assert f"platform = {_PIOARDUINO_URL}\n" in ini
+
+
+def test_lock_ini_uses_platformio_owner_when_unknown() -> None:
+    lockdata = {"envs": {"e": {"platform": asdict(_lock()), "libraries": []}}}
+    assert "platform = platformio/espressif32@6.6.0\n" in pio_lock.render_lock_ini(lockdata)
+
+
+def test_lock_ini_keeps_user_platform_packages(tmp_project: Path, fake_pio: Any) -> None:
+    user_pkg = (
+        "framework-arduinoespressif32 @ https://github.com/espressif/arduino-esp32.git#abc123"
+    )
+    (tmp_project / "platformio.ini").write_text(
+        f"[env:testenv]\nplatform = espressif32\nplatform_packages =\n  {user_pkg}\n"
+    )
+    git_url = "https://github.com/espressif/arduino-esp32.git#abc123"
+    fake_pio(
+        {
+            "testenv": _lock(
+                platform_packages_spec=[user_pkg],
+                packages=[
+                    PackageLock(
+                        "framework-arduinoespressif32", "3.0.0", owner=None, src_url=git_url
+                    ),
+                    PackageLock("toolchain-xtensa-esp32", "8.4.0", owner="espressif"),
+                ],
+            )
+        }
+    )
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    platform = _read_lock(tmp_project)["envs"]["testenv"]["platform"]
+    assert platform["platform_packages_spec"] == [user_pkg]
+    assert platform["packages"][0]["src_url"] == git_url
+    ini = (tmp_project / "pio.lock.ini").read_text()
+    assert f"  {user_pkg}\n" in ini
+
+
+def test_lock_ini_omits_local_file_packages() -> None:
+    lockdata = {
+        "envs": {
+            "e": {
+                "platform": asdict(
+                    _lock(
+                        packages=[
+                            PackageLock("tool-esptoolpy", "5.0.0", src_url="file:///Users/x/tool"),
+                            PackageLock("toolchain-xtensa-esp32", "8.4.0", owner="espressif"),
+                        ]
+                    )
+                ),
+                "libraries": [],
+            }
+        }
+    }
+    ini = pio_lock.render_lock_ini(lockdata)
+    assert "file://" not in ini
+    assert "tool-esptoolpy" not in ini
+    assert "  espressif/toolchain-xtensa-esp32@8.4.0\n" in ini
+
+
+def test_partial_capture_keeps_other_envs(tmp_project: Path, fake_pio: Any) -> None:
+    (tmp_project / "platformio.ini").write_text(
+        "[env]\nplatform = espressif32\n[env:a]\n[env:b]\n"
+    )
+    fake_pio({"a": _lock(), "b": _lock(version="6.5.0")})
+    assert pio_lock.capture(tmp_project, ["a", "b"]) == 0
+    fake_pio({"a": _lock(version="6.7.0")})
+    assert pio_lock.capture(tmp_project, ["a"]) == 0
+    envs = _read_lock(tmp_project)["envs"]
+    assert envs["a"]["platform"]["version"] == "6.7.0"
+    assert envs["b"]["platform"]["version"] == "6.5.0"
+    ini = (tmp_project / "pio.lock.ini").read_text()
+    assert "[env:a]" in ini
+    assert "[env:b]" in ini
+
+
+def test_capture_prunes_removed_envs(tmp_project: Path, fake_pio: Any, capsys: Any) -> None:
+    (tmp_project / "platformio.ini").write_text(
+        "[env]\nplatform = espressif32\n[env:old]\n[env:testenv]\n"
+    )
+    fake_pio({"old": _lock(), "testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["old", "testenv"]) == 0
+    (tmp_project / "platformio.ini").write_text("[env:testenv]\nplatform = espressif32\n")
+    capsys.readouterr()
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    assert "old" not in _read_lock(tmp_project)["envs"]
+    assert "[env:old]" not in (tmp_project / "pio.lock.ini").read_text()
+    assert "Pruned env 'old'" in capsys.readouterr().out
+
+
+def test_capture_excludes_pio_lock_itself(
+    tmp_project: Path, fake_pio: Any, make_registry_lib: Any
+) -> None:
+    make_registry_lib("testenv", "pio-lock", "0.4.0", owner="m-mcgowan", project_dir=tmp_project)
+    make_registry_lib("testenv", "MyLib", "1.0.0", project_dir=tmp_project)
+    fake_pio({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    names = [lib["name"] for lib in _read_lock(tmp_project)["envs"]["testenv"]["libraries"]]
+    assert names == ["MyLib"]
+
+
+def test_capture_platform_inherited_from_env_section(tmp_project: Path, fake_pio: Any) -> None:
+    (tmp_project / "platformio.ini").write_text(
+        "[env]\nplatform = espressif32\n[env:a]\nboard = x\n[env:b]\nboard = y\n"
+    )
+    # The fake resolves spec/platform_packages_spec from the user's config view, like the real one.
+    fake_pio({"a": _lock(spec="?"), "b": _lock(spec="?")})
+    assert pio_lock.capture(tmp_project, ["a", "b"]) == 0
+    envs = _read_lock(tmp_project)["envs"]
+    assert envs["a"]["platform"]["spec"] == "espressif32"
+    assert envs["b"]["platform"]["spec"] == "espressif32"
+
+
+def test_capture_incompatible_pio_keeps_libraries(
+    tmp_project: Path, fake_pio: Any, make_registry_lib: Any, capsys: Any
+) -> None:
+    make_registry_lib("testenv", "MyLib", "1.0.0", project_dir=tmp_project)
+    fake_pio({"testenv": _lock()}, incompatible="PlatformFactory.from_env")
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    env_lock = _read_lock(tmp_project)["envs"]["testenv"]
+    assert "platform" not in env_lock
+    assert [lib["name"] for lib in env_lock["libraries"]] == ["MyLib"]
+    out = capsys.readouterr()
+    assert "PlatformFactory.from_env" in out.out + out.err
+    assert not (tmp_project / "pio.lock.ini").read_text().count("[env:")
+
+
+def test_capture_platform_not_installed_fails(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    fake_pio({})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 1
+    assert not (tmp_project / "pio.lock.json").exists()
+    assert not (tmp_project / "pio.lock.ini").exists()
+    out = capsys.readouterr()
+    assert "pio pkg install -e testenv" in out.out + out.err
+
+
+def test_load_lockfile_defaults_v1(tmp_path: Path) -> None:
+    path = tmp_path / "pio.lock.json"
+    path.write_text(json.dumps({"envs": {"a": {"libraries": []}}}))
+    assert pio_lock.load_lockfile(path)["lockfile_version"] == 1
+    path.write_text(json.dumps({"lockfile_version": 2, "envs": {}}))
+    assert pio_lock.load_lockfile(path)["lockfile_version"] == 2
+
+
+def test_env_lock_is_stale() -> None:
+    env_lock = {"platform": asdict(_lock(platform_packages_spec=["tool-a @ 1.0"]))}
+    assert not pio_lock.env_lock_is_stale(env_lock, "espressif32", ["tool-a @ 1.0"])
+    assert pio_lock.env_lock_is_stale(env_lock, "espressif32@6.7.0", ["tool-a @ 1.0"])
+    assert pio_lock.env_lock_is_stale(env_lock, "espressif32", [])
+    assert pio_lock.env_lock_is_stale({"libraries": []}, "espressif32", [])

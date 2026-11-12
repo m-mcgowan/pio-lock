@@ -400,7 +400,6 @@ def test_cli_from_python_without_platformio(bare_venv: Path, tmp_path: Path, var
 
 
 @requires_pio
-@pytest.mark.xfail(strict=True, reason="capture records the platform from Task 5 (capture v2)")
 @pytest.mark.parametrize("variant", ["script", "entry_point"])
 def test_cli_without_platformio_locks_platform(
     bare_venv: Path, tmp_path: Path, variant: str
@@ -442,3 +441,42 @@ def test_reexec_does_not_loop(bare_venv: Path, tmp_path: Path) -> None:
     env_lock = _lockfile(p)["envs"]["native"]
     assert "libraries" in env_lock
     assert "platform" not in env_lock
+
+
+@requires_pio
+def test_capture_native_end_to_end(tmp_path: Path) -> None:
+    p = make_native_project(tmp_path / "proj", "[env:native]\nplatform = native\n")
+    assert run_pio(p, "pkg", "install", "-e", "native").returncode == 0
+    result = _run_cli(
+        [sys.executable, str(REPO_ROOT / "pio_lock.py"), "-d", str(p), "capture", "-e", "native"]
+    )
+    assert result.returncode == 0, result.stdout
+    data = _lockfile(p)
+    assert data["lockfile_version"] == 2
+    platform = data["envs"]["native"]["platform"]
+    assert platform["name"] == "native"
+    assert platform["spec"] == "native"
+    ini = (p / "pio.lock.ini").read_text()
+    assert f"platform = platformio/native@{platform['version']}\n" in ini
+
+
+@requires_pio
+def test_capture_platform_inherited_from_env_section_real_pio(tmp_path: Path) -> None:
+    p = make_native_project(tmp_path / "proj", "[env]\nplatform = native\n[env:a]\n[env:b]\n")
+    assert run_pio(p, "pkg", "install", "-e", "a").returncode == 0
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "pio_lock.py"),
+        "-d",
+        str(p),
+        "capture",
+        "-e",
+        "a",
+        "-e",
+        "b",
+    ]
+    result = _run_cli(cmd)
+    assert result.returncode == 0, result.stdout
+    envs = _lockfile(p)["envs"]
+    assert envs["a"]["platform"]["spec"] == "native"
+    assert envs["b"]["platform"]["spec"] == "native"

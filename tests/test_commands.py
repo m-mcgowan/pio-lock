@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 import pio_lock
-from tests.conftest import write_lockfile
+from tests.conftest import espressif32_lock, write_lockfile
 
 
 class TestCapture:
@@ -16,10 +16,10 @@ class TestCapture:
         tmp_project,
         make_registry_lib,
         mock_git_commands,
-        make_global_packages,
+        fake_pio,
     ):
         make_registry_lib("testenv", "MyLib", "1.0.0", project_dir=tmp_project)
-        make_global_packages("framework-test", "2.0.0")
+        fake_pio({"testenv": espressif32_lock()})
 
         rc = pio_lock.capture(tmp_project, ["testenv"])
         assert rc == 0
@@ -33,34 +33,42 @@ class TestCapture:
         libs = data["envs"]["testenv"]["libraries"]
         assert len(libs) == 1
         assert libs[0]["name"] == "MyLib"
-        assert data["global_packages"]["framework-test"] == "2.0.0"
+        assert data["lockfile_version"] == 2
+        assert "global_packages" not in data
+        assert "platform_url" not in data
+        assert data["envs"]["testenv"]["platform"]["version"] == "6.6.0"
+        assert (tmp_project / "pio.lock.ini").exists()
 
     def test_capture_custom_output(
         self,
         tmp_project,
         make_registry_lib,
         mock_git_commands,
-        make_global_packages,
+        fake_pio,
     ):
         make_registry_lib("testenv", "Lib", project_dir=tmp_project)
-        make_global_packages("toolchain-test", "1.0.0")
+        fake_pio({"testenv": espressif32_lock()})
 
         output = tmp_project / "custom" / "lock.json"
         rc = pio_lock.capture(tmp_project, ["testenv"], output_path=output)
         assert rc == 0
         assert output.exists()
         assert not (tmp_project / "pio.lock.json").exists()
+        assert json.loads(output.read_text())["lockfile_version"] == 2
 
     def test_capture_multiple_envs(
         self,
         tmp_project,
         make_registry_lib,
         mock_git_commands,
-        make_global_packages,
+        fake_pio,
     ):
         make_registry_lib("env1", "LibA", project_dir=tmp_project)
         make_registry_lib("env2", "LibB", project_dir=tmp_project)
-        make_global_packages("toolchain-test", "1.0.0")
+        (tmp_project / "platformio.ini").write_text(
+            "[env]\nplatform = espressif32\n[env:env1]\n[env:env2]\n"
+        )
+        fake_pio({"env1": espressif32_lock(), "env2": espressif32_lock("6.5.0")})
 
         rc = pio_lock.capture(tmp_project, ["env1", "env2"])
         assert rc == 0
@@ -68,6 +76,7 @@ class TestCapture:
         data = json.loads((tmp_project / "pio.lock.json").read_text())
         assert "env1" in data["envs"]
         assert "env2" in data["envs"]
+        assert data["envs"]["env2"]["platform"]["version"] == "6.5.0"
 
     def test_capture_fails_without_platformio_ini(self, tmp_path, mock_git_commands):
         rc = pio_lock.capture(tmp_path, ["testenv"])
@@ -78,7 +87,7 @@ class TestCapture:
         tmp_project,
         make_git_lib,
         mock_git_commands,
-        make_global_packages,
+        fake_pio,
     ):
         make_git_lib(
             "testenv",
@@ -87,7 +96,7 @@ class TestCapture:
             url="https://github.com/test/dep.git",
             project_dir=tmp_project,
         )
-        make_global_packages("toolchain-x", "1.0")
+        fake_pio({"testenv": espressif32_lock()})
         rc = pio_lock.capture(tmp_project, ["testenv"])
         assert rc == 0
 
@@ -472,11 +481,9 @@ class TestLibInstallSpec:
 class TestCLI:
     """Tests for the main() CLI argument parsing."""
 
-    def test_capture_args(
-        self, tmp_project, make_registry_lib, mock_git_commands, make_global_packages
-    ):
+    def test_capture_args(self, tmp_project, make_registry_lib, mock_git_commands, fake_pio):
         make_registry_lib("testenv", "Lib", project_dir=tmp_project)
-        make_global_packages("toolchain-x", "1.0")
+        fake_pio({"testenv": espressif32_lock()})
 
         rc = pio_lock.main(
             [

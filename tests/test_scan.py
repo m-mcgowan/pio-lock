@@ -123,24 +123,3 @@ class TestScanEnvLibraries:
         libs = pio_lock.scan_env_libraries(tmp_project, "testenv")
         names = [lib["name"] for lib in libs]
         assert names == ["AAA-Local", "BBB-Git", "CCC-Registry"]
-
-
-class TestScanGlobalPackages:
-    """Tests for scan_global_packages."""
-
-    def test_captures_matching_prefixes(self, make_global_packages):
-        make_global_packages("framework-arduino", "3.0.0")
-        make_global_packages("toolchain-xtensa", "14.2.0")
-        make_global_packages("tool-cmake", "4.0.3")
-        make_global_packages("contrib-piohome", "1.0.0")  # should be skipped
-
-        pkgs = pio_lock.scan_global_packages()
-        assert "framework-arduino" in pkgs
-        assert "toolchain-xtensa" in pkgs
-        assert "tool-cmake" in pkgs
-        assert "contrib-piohome" not in pkgs
-
-    def test_empty_packages_dir(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("PLATFORMIO_CORE_DIR", str(tmp_path / "empty"))
-        pkgs = pio_lock.scan_global_packages()
-        assert pkgs == {}

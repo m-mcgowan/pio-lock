@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import configparser
+import dataclasses
 import glob
 import os
 from pathlib import Path
@@ -64,9 +65,10 @@ class FakePioAdapter:
     """Stands in for ``pio_lock.PioAdapter``; install via ``_pio_adapter_factory``.
 
     ``platforms`` maps env -> the PlatformLock ``resolve_platform`` returns (missing env ->
-    PlatformNotInstalled). ``in_use`` maps env -> ``platform_in_use`` result (defaults to the
-    locked name/version). ``incompatible`` names a call: probe/resolve/in_use then raise
-    PioIncompatible. Config views are real configparser reads of the project.
+    PlatformNotInstalled), with ``spec``/``platform_packages_spec`` read from the user's config
+    view as the real adapter does. ``in_use`` maps env -> ``platform_in_use`` result
+    (defaults to the locked name/version). ``incompatible`` names a call: probe/resolve/in_use
+    then raise PioIncompatible. Config views are real configparser reads of the project.
     """
 
     def __init__(
@@ -104,7 +106,13 @@ class FakePioAdapter:
         self._check()
         if env not in self.platforms:
             raise PlatformNotInstalled(env)
-        return self.platforms[env]
+        # Like the real adapter, the spec and user platform_packages come from the user's view.
+        view = self.user_config(project_dir)
+        return dataclasses.replace(
+            self.platforms[env],
+            spec=str(view.get(f"env:{env}", "platform", self.platforms[env].spec)),
+            platform_packages_spec=list(view.get(f"env:{env}", "platform_packages", [])),
+        )
 
     def platform_in_use(self, project_dir: Path, env: str) -> tuple[str, str]:
         self._check()
