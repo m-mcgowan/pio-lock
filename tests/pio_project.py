@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -85,3 +87,34 @@ def run_pio(
         env=full_env,
         timeout=timeout,
     )
+
+
+def pio_python() -> str:
+    """PlatformIO's own Python interpreter (the one that can import ``platformio``)."""
+    out = subprocess.run(
+        ["pio", "system", "info", "--json-output"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    ).stdout
+    return str(json.loads(out)["python_exe"]["value"])
+
+
+def run_in_pio_python(code: str, *args: str, cwd: Path | None = None) -> Any:
+    """Run ``code`` under PlatformIO's Python with the repo importable; return its JSON output.
+
+    The dev venv has no ``platformio``, so tests that need the real PlatformIO API in-process
+    run it here. ``code`` sees ``sys.argv[1:] == args`` and must print one JSON document as the
+    last line of stdout.
+    """
+    prelude = f"import sys; sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+    result = subprocess.run(
+        [pio_python(), "-c", prelude + code, *args],
+        capture_output=True,
+        text=True,
+        cwd=str(cwd) if cwd else None,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return json.loads(result.stdout.strip().splitlines()[-1])

@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 import configparser
 import contextlib
+import glob
+import importlib
 import json
 import os
 import re
@@ -25,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -741,6 +744,277 @@ def _import_pio():
 
 # Mockable seam — tests replace this to avoid requiring PIO.
 _pio_import_fn = _import_pio
+
+
+# ── PlatformIO adapter (the only door to platform internals) ────────────────
+#
+# Everything pio-lock needs from PlatformIO's platform/package internals goes through
+# PioAdapter. These are not a documented public API, so ``probe()`` checks every import and
+# attribute used here and reports the first one that is missing, with the Core version.
+
+LOCK_INI_NAME = "pio.lock.ini"
+
+
+@dataclass
+class PackageLock:
+    """One package an env's platform uses, as installed."""
+
+    name: str
+    version: str
+    owner: Optional[str] = None
+    src_url: Optional[str] = None
+
+
+@dataclass
+class PlatformLock:
+    """An env's platform as the user's spec resolves it, with the packages it uses."""
+
+    spec: str
+    platform_packages_spec: list[str]
+    name: str
+    version: str
+    src_url: Optional[str]
+    packages: list[PackageLock]
+
+
+class PioIncompatible(Exception):  # noqa: N818 (name fixed by the 0.4.0 interface)
+    """A PlatformIO internal pio-lock relies on is missing or behaves differently."""
+
+    def __init__(self, call: str, core_version: str, cause: str) -> None:
+        self.call = call
+        self.core_version = core_version
+        self.cause = cause
+        super().__init__(
+            f"PlatformIO Core {core_version} is not compatible with pio-lock: "
+            f"{call} failed ({cause})"
+        )
+
+
+class PlatformNotInstalled(Exception):  # noqa: N818 (name fixed by the 0.4.0 interface)
+    """The platform (or one of its packages) an env resolves to is not installed."""
+
+    def __init__(self, env: str) -> None:
+        self.env = env
+        super().__init__(
+            f"platform for env '{env}' is not installed; run: pio pkg install -e {env}"
+        )
+
+
+# (module, attribute path) pairs PioAdapter uses — checked by probe() in this order.
+_PIO_INTERNALS: tuple[tuple[str, str], ...] = (
+    ("platformio", "__version__"),
+    ("platformio.project.config", "ProjectConfig.read"),
+    ("platformio.project.config", "ProjectConfig.get"),
+    ("platformio.project.config", "ProjectConfig.items"),
+    ("platformio.package.manager.platform", "PlatformPackageManager.get_package"),
+    ("platformio.platform.factory", "PlatformFactory.new"),
+    ("platformio.platform.base", "PlatformBase.configure_project_packages"),
+    ("platformio.platform.base", "PlatformBase.packages"),
+    ("platformio.platform.base", "PlatformBase.get_package"),
+)
+
+
+def _describe(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+@contextlib.contextmanager
+def _chdir(path: Path):
+    """Temporarily make ``path`` the working directory (PlatformIO assumes cwd = project)."""
+    previous = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+class PioAdapter:
+    """Probed access to PlatformIO's project config and platform internals.
+
+    PlatformIO is imported lazily, inside methods, so this module imports without it.
+    Platform resolution only looks at installed packages: it never installs or hits the network.
+    """
+
+    def _import(self, module: str) -> Any:
+        return importlib.import_module(module)
+
+    def _lookup(self, module: str, attr_path: str) -> Any:
+        try:
+            obj = self._import(module)
+        except Exception as exc:
+            raise PioIncompatible(f"import {module}", self.core_version(), _describe(exc)) from exc
+        for part in attr_path.split("."):
+            try:
+                obj = getattr(obj, part)
+            except AttributeError as exc:
+                raise PioIncompatible(
+                    f"{module}.{attr_path}", self.core_version(), "missing attribute"
+                ) from exc
+        return obj
+
+    @contextlib.contextmanager
+    def _calling(self, call: str):
+        """Report a PlatformIO internal whose signature or results changed as incompatible."""
+        try:
+            yield
+        except (AttributeError, TypeError) as exc:
+            raise PioIncompatible(call, self.core_version(), _describe(exc)) from exc
+
+    def core_version(self) -> str:
+        try:
+            return str(self._import("platformio").__version__)
+        except Exception:
+            return "unknown"
+
+    def probe(self) -> None:
+        for module, attr_path in _PIO_INTERNALS:
+            self._lookup(module, attr_path)
+
+    # ── Project config views ──
+
+    def _config_view(self, project_dir: Path, include_lock_ini: bool) -> tuple[Any, list[Path]]:
+        """Read platformio.ini and its extra_configs like PlatformIO does, but CWD-independent.
+
+        PlatformIO resolves ``extra_configs`` globs against the process CWD; here they are
+        resolved against ``project_dir``. Returns the config and the files in read order.
+        """
+        project_config = self._lookup("platformio.project.config", "ProjectConfig")
+        project_dir = Path(project_dir).resolve()
+        main_ini = project_dir / "platformio.ini"
+        lock_ini = os.path.realpath(project_dir / LOCK_INI_NAME)
+        with self._calling("platformio.project.config.ProjectConfig"):
+            config = project_config(str(main_ini), parse_extra=False)
+        files = [main_ini]
+        seen = {os.path.realpath(main_ini)}
+
+        def read_extra() -> None:
+            # Same order as ProjectConfig.read: after each file, walk the (current) patterns.
+            with self._calling("platformio.project.config.ProjectConfig.get"):
+                patterns = list(config.get("platformio", "extra_configs", []))
+            for pattern in patterns:
+                pattern = os.path.expanduser(pattern)
+                if not os.path.isabs(pattern):
+                    pattern = os.path.join(glob.escape(str(project_dir)), pattern)
+                for item in glob.glob(pattern, recursive=True):
+                    real = os.path.realpath(item)
+                    if real in seen or (not include_lock_ini and real == lock_ini):
+                        continue
+                    seen.add(real)
+                    with self._calling("platformio.project.config.ProjectConfig.read"):
+                        config.read(item, parse_extra=False)
+                    files.append(Path(item))
+                    read_extra()
+
+        read_extra()
+        return config, files
+
+    def user_config(self, project_dir: Path) -> Any:
+        """platformio.ini plus its extra_configs, except pio.lock.ini."""
+        return self._config_view(project_dir, include_lock_ini=False)[0]
+
+    def full_config(self, project_dir: Path) -> Any:
+        """platformio.ini plus all its extra_configs (what a build sees)."""
+        return self._config_view(project_dir, include_lock_ini=True)[0]
+
+    def config_files(self, project_dir: Path) -> list[Path]:
+        """The config files PlatformIO reads for this project, in read order."""
+        return self._config_view(project_dir, include_lock_ini=True)[1]
+
+    # ── Platform resolution (installed packages only) ──
+
+    @staticmethod
+    def _platform_spec(config: Any, env: str) -> str:
+        spec = config.get(f"env:{env}", "platform", None)
+        if not spec:
+            raise ValueError(f"env '{env}' has no platform")
+        return str(spec)
+
+    def _installed_platform(self, spec: str, env: str) -> Any:
+        manager_cls = self._lookup("platformio.package.manager.platform", "PlatformPackageManager")
+        with self._calling("platformio.package.manager.platform.PlatformPackageManager"):
+            pkg = manager_cls().get_package(spec)
+        if pkg is None:
+            raise PlatformNotInstalled(env)
+        return pkg
+
+    def resolve_platform(self, project_dir: Path, env: str) -> PlatformLock:
+        """Resolve the env's platform and used packages from the user's view (no pio.lock.ini)."""
+        project_dir = Path(project_dir).resolve()
+        config = self.user_config(project_dir)
+        spec = self._platform_spec(config, env)
+        factory = self._lookup("platformio.platform.factory", "PlatformFactory")
+        with _chdir(project_dir):
+            pkg = self._installed_platform(spec, env)
+            with self._calling("platformio.platform.factory.PlatformFactory.new"):
+                platform = factory.new(pkg)
+            if not hasattr(platform, "config"):
+                raise PioIncompatible(
+                    "platformio.platform.base.PlatformBase.config",
+                    self.core_version(),
+                    "missing attribute",
+                )
+            # The platform reads ProjectConfig.get_instance() (which includes pio.lock.ini);
+            # point it at the user's view before it applies platform_packages.
+            platform.config = config
+            platform.project_env = env
+            with self._calling("platformio.platform.base.PlatformBase.configure_project_packages"):
+                platform.configure_project_packages(env)
+            packages = self._used_packages(platform, env)
+            with self._calling("platformio.package.meta.PackageMetadata"):
+                meta = pkg.metadata
+                name = str(meta.name)
+                version = str(meta.version)
+                src_url = str(meta.spec.uri) if meta.spec.external else None
+        with self._calling("platformio.project.config.ProjectConfig.get"):
+            platform_packages = [
+                str(item) for item in config.get(f"env:{env}", "platform_packages", [])
+            ]
+        return PlatformLock(
+            spec=spec,
+            platform_packages_spec=platform_packages,
+            name=name,
+            version=version,
+            src_url=src_url,
+            packages=packages,
+        )
+
+    def _used_packages(self, platform: Any, env: str) -> list[PackageLock]:
+        """The non-optional packages the platform uses (as dump_used_packages), with owners.
+
+        A used package that is not installed means the env is not installed.
+        """
+        result: list[PackageLock] = []
+        with self._calling("platformio.platform.base.PlatformBase.packages"):
+            for pkg_name, options in platform.packages.items():
+                if options.get("optional"):
+                    continue
+                pkg = platform.get_package(pkg_name)
+                if not pkg or not pkg.metadata:
+                    raise PlatformNotInstalled(env)
+                meta = pkg.metadata
+                result.append(
+                    PackageLock(
+                        name=str(meta.name),
+                        version=str(meta.version),
+                        owner=options.get("owner") or meta.spec.owner,
+                        src_url=str(meta.spec.uri) if meta.spec.external else None,
+                    )
+                )
+        return result
+
+    def platform_in_use(self, project_dir: Path, env: str) -> tuple[str, str]:
+        """(name, version) of the platform a build of ``env`` uses (pio.lock.ini included)."""
+        project_dir = Path(project_dir).resolve()
+        spec = self._platform_spec(self.full_config(project_dir), env)
+        with _chdir(project_dir):
+            pkg = self._installed_platform(spec, env)
+            with self._calling("platformio.package.meta.PackageMetadata"):
+                return str(pkg.metadata.name), str(pkg.metadata.version)
+
+
+# Mockable seam — tests replace this with a factory returning a fake adapter.
+_pio_adapter_factory: Callable[[], PioAdapter] = PioAdapter
 
 
 # ── GitHub-aware update detection ──────────────────────────────────────────
