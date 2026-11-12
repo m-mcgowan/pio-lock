@@ -608,7 +608,7 @@ class TestUpdate:
         assert self._install(tmp_path, "--library", "acme/Foo @ ==1.2.0") in commands
         assert [
             "pio", "pkg", "uninstall", "-d", str(tmp_path), "-e", "test",
-            "--library", "acme/Foo @ ==1.0.0", "--no-save",
+            "--library", "acme/Foo @ ==1.0.0", "--skip-dependencies", "--no-save",
         ] in commands  # fmt: skip
         assert mock_pio.captured_envs == [["test"]]
 
@@ -684,10 +684,13 @@ class TestUpdate:
         assert pio_lock.update(tmp_path, ["test"]) == 0
         assert "    acme/Foo @ 1.3.0\n" in (tmp_path / "platformio.ini").read_text()
 
-    def test_update_branch_moves_locked_sha_only(self, tmp_path, mock_pio, monkeypatch, capsys):
+    def test_update_branch_moves_locked_sha_only(
+        self, tmp_path, mock_pio, monkeypatch, capsys, make_git_lib
+    ):
         url = "https://github.com/o/r.git"
         ini = f"[env:test]\nlib_deps =\n    {url}#dev\n"
         (tmp_path / "platformio.ini").write_text(ini)
+        make_git_lib("test", "r", sha=HEAD, url=url)  # where the install leaves it
         mock_pio.add_lib("test", f"{url}#dev", "r", f"1.0.0+sha.{LOCKED}", external=True)
         lock_lib = {"name": "r", "type": "git", "url": url, "sha": LOCKED, "ref": "dev"}
         lock = {"lockfile_version": 2, "envs": {"test": {"libraries": [lock_lib]}}}
@@ -810,13 +813,75 @@ class TestUpdate:
 
         assert pio_lock.update(tmp_path, ["test"]) == 0
         uninstalls = [c for c in mock_pio.pio_commands() if c[2] == "uninstall"]
-        assert uninstalls == [
-            [
-                "pio", "pkg", "uninstall", "-d", str(tmp_path), "-e", "test",
-                "--library", f"file://{stale}", "--no-save",
-            ]
-        ]  # fmt: skip
+        assert uninstalls
+        assert all(
+            c[7:] == ["--library", f"file://{stale}", "--skip-dependencies", "--no-save"]
+            for c in uninstalls
+        )
         assert other.exists()
+
+    def _git_move_setup(self, tmp_path, mock_pio, monkeypatch, make_git_lib):
+        url = "https://github.com/o/r.git"
+        ini = f"[env:test]\nlib_deps =\n    {url}#dev\n"
+        (tmp_path / "platformio.ini").write_text(ini)
+        mock_pio.add_lib("test", f"{url}#dev", "r", f"1.0.0+sha.{LOCKED}", external=True)
+        lock_lib = {"name": "r", "type": "git", "url": url, "sha": LOCKED, "ref": "dev"}
+        lock = {"lockfile_version": 2, "envs": {"test": {"libraries": [lock_lib]}}}
+        (tmp_path / "pio.lock.json").write_text(json.dumps(lock))
+        github = FakeGitHubClient({"repos/o/r/branches/dev": {"commit": {"sha": HEAD}}})
+        monkeypatch.setattr(pio_lock, "_create_github_client_fn", lambda: github)
+        return url, ini
+
+    def test_update_git_move_fails_when_checkout_not_at_target(
+        self, tmp_path, mock_pio, monkeypatch, make_git_lib, capsys
+    ):
+        """The target commit sits in a detached copy and the install was a no-op: the plain
+        checkout is still the old commit, so the move is reported as failed, not claimed."""
+        url, ini = self._git_move_setup(tmp_path, mock_pio, monkeypatch, make_git_lib)
+        make_git_lib("test", "r", sha=LOCKED, url=url)
+        target_copy = make_git_lib("test", "r@src-0123", sha=HEAD, url=url)
+
+        assert pio_lock.update(tmp_path, ["test"]) == 1
+        assert mock_pio.captured_envs == []
+        assert (tmp_path / "platformio.ini").read_text() == ini
+        err = capsys.readouterr().err
+        assert f"not {HEAD[:7]}" in err
+        assert "were NOT changed" in err
+        # after the install, the copy at the target commit is never removed
+        commands = mock_pio.pio_commands()
+        install_at = next(i for i, c in enumerate(commands) if c[2] == "install")
+        assert not any(
+            c[2] == "uninstall" and c[8] == f"file://{target_copy}" for c in commands[install_at:]
+        )
+
+    def test_update_removed_only_listed_when_uninstall_succeeded(self, tmp_path, mock_pio, capsys):
+        ini = "[env:test]\nlib_deps =\n    acme/Foo @ ^1.0.0\n    acme/Bar @ ^1.0.0\n"
+        (tmp_path / "platformio.ini").write_text(ini)
+        self._foo(mock_pio)
+        mock_pio.add_lib(
+            "test", "acme/Bar @ ^1.0.0", "Bar", "1.0.0", latest="1.1.0", wanted="1.1.0"
+        )
+        mock_pio.fail_command("acme/Foo @ ==1.0.0")
+        mock_pio.fail_command("acme/Bar @ ==1.1.0")
+        assert pio_lock.update(tmp_path, ["test"]) == 1
+        err = capsys.readouterr().err
+        assert "already installed: acme/Foo @ ==1.2.0" in err
+        assert "already removed: acme/Foo @ ==1.0.0" not in err
+        assert "could not remove acme/Foo @ ==1.0.0" in err
+
+    def test_update_lock_only_beyond_range_unrewritable_spec_moves_lock(
+        self, tmp_path, mock_pio, capsys
+    ):
+        ini = "[env:test]\nlib_deps =\n    acme/Foo @ <2.0\n"
+        (tmp_path / "platformio.ini").write_text(ini)
+        self._foo(mock_pio, wanted="1.0.0", latest="2.1.0", spec="acme/Foo @ <2.0")
+        assert pio_lock.update(tmp_path, ["test"], beyond_range=True, lock_only=True) == 0
+        assert (tmp_path / "platformio.ini").read_text() == ini
+        assert self._install(tmp_path, "--library", "acme/Foo @ ==2.1.0") in (
+            mock_pio.pio_commands()
+        )
+        assert mock_pio.captured_envs == [["test"]]
+        assert "edit the ini by hand" not in capsys.readouterr().out
 
 
 # ── Tests for ConfigSourceTracker ─────────────────────────────────────────────

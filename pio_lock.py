@@ -1881,6 +1881,16 @@ def _newer_version_tags(
     return [tag_name for _key, tag_name in newer]
 
 
+def _tag_commit_sha(owner: str, repo: str, tag: str, github: GitHubClient) -> Optional[str]:
+    """The commit ``tag`` points at, from the tags listing; None if unknown."""
+    tags = github.get_json(f"repos/{owner}/{repo}/tags?per_page=100")
+    for item in tags if isinstance(tags, list) else []:
+        if isinstance(item, dict) and item.get("name") == tag:
+            sha = (item.get("commit") or {}).get("sha")
+            return str(sha) if sha else None
+    return None
+
+
 def _check_tag_dep(
     owner: str, repo: str, tag: str, name: str, github: GitHubClient
 ) -> Optional[dict[str, Any]]:
@@ -2615,7 +2625,8 @@ class _Move:
     commands: list[list[str]]
     edit: Optional[_Edit] = None
     platform_spec: Optional[str] = None  # installed platform to lock (platforms only)
-    git_url: Optional[str] = None  # git library: remove stale checkouts of this repo after
+    git_url: Optional[str] = None  # git library: moved by _move_git_checkout
+    target_sha: Optional[str] = None  # git library: the commit the checkout must end at
 
 
 _NO_GITHUB_NOTE = (
@@ -2688,7 +2699,14 @@ def _plan_registry_library(
     env = entry["env"]
     commands = [
         plan.pio(env, "install", "--library", f"{name_part} @ =={target}", "--no-save"),
-        plan.pio(env, "uninstall", "--library", f"{name_part} @ =={current}", "--no-save"),
+        plan.pio(
+            env,
+            "uninstall",
+            "--library",
+            f"{name_part} @ =={current}",
+            "--skip-dependencies",  # the new version still needs them
+            "--no-save",
+        ),
     ]
     plan.moves.append(_Move(env, entry["name"], current, target, commands, edit))
 
@@ -2717,7 +2735,9 @@ def _plan_git_library(
         head = str(result["head"])
         locked = _sha_from_version(str(entry["current"])) or str(entry["current"])
         commands = [plan.pio(env, "install", "--library", f"{url}#{head}", "--no-save")]
-        plan.moves.append(_Move(env, name, locked[:7], head[:7], commands, git_url=url))
+        plan.moves.append(
+            _Move(env, name, locked[:7], head[:7], commands, git_url=url, target_sha=head)
+        )
         return
     if ref_type != "tag" or ref is None:
         return  # a sha is an explicit pin
@@ -2741,7 +2761,10 @@ def _plan_git_library(
             return
         edit = _Edit(source, spec_str, new_spec)
     commands = [plan.pio(env, "install", "--library", f"{url}#{target}", "--no-save")]
-    plan.moves.append(_Move(env, name, ref, target, commands, edit, git_url=url))
+    target_sha = _tag_commit_sha(owner, repo, target, github)
+    plan.moves.append(
+        _Move(env, name, ref, target, commands, edit, git_url=url, target_sha=target_sha)
+    )
 
 
 def _platform_edit(
@@ -2881,40 +2904,98 @@ def _shared_section_notes(project_dir: Path, edits: list[_Edit], envs: list[str]
             path, section, raw = found
             if Path(path).resolve() != Path(edit.path).resolve():
                 continue
-            if section == edit.section if edit.section is not None else edit.old in raw:
+            if (section == edit.section) if edit.section is not None else (edit.old in raw):
                 note = f"[{section}] also applies to env {other}; run pio-lock update -e {other}"
                 if note not in notes:
                     notes.append(note)
     return notes
 
 
-def _remove_stale_git_copies(project_dir: Path, env: str, url: str) -> list[list[str]]:
-    """Uninstall the detached ``<name>@src-<hash>`` checkouts of ``url`` in ``env``'s libdeps.
-
-    Installing a git library at another ref makes PlatformIO keep the previous checkout as a
-    detached copy, which a build could still pick up. Returns the commands run.
-    """
+def _git_checkouts(project_dir: Path, env: str, url: str) -> tuple[list[Path], list[Path]]:
+    """(plain, detached ``@src-``) checkouts of ``url`` in ``env``'s libdeps."""
     libdeps_dir = project_dir / ".pio" / "libdeps" / env
+    plain: list[Path] = []
+    detached: list[Path] = []
     if not libdeps_dir.is_dir():
-        return []
+        return plain, detached
     wanted = _normalize_git_url(url)
-    commands: list[list[str]] = []
     for lib_dir in sorted(libdeps_dir.iterdir()):
-        if "@src-" not in lib_dir.name or not (lib_dir / ".git").exists():
+        if not lib_dir.is_dir() or not (lib_dir / ".git").exists():
             continue
         try:
             remote = get_git_remote_url(lib_dir)
         except (OSError, subprocess.CalledProcessError):
             continue
-        if _normalize_git_url(remote) != wanted:
+        if _normalize_git_url(remote) == wanted:
+            (detached if "@src-" in lib_dir.name else plain).append(lib_dir)
+    return plain, detached
+
+
+def _git_head(lib_dir: Path) -> Optional[str]:
+    try:
+        return get_git_sha(lib_dir)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
+    return bool(a and b and (a.startswith(b) or b.startswith(a)))
+
+
+def _uninstall_checkout(project_dir: Path, env: str, lib_dir: Path) -> Optional[list[str]]:
+    """Uninstall one checkout (not its dependencies); the command if it succeeded."""
+    command = [
+        "pio", "pkg", "uninstall", "-d", str(project_dir), "-e", env,
+        "--library", f"file://{lib_dir}", "--skip-dependencies", "--no-save",
+    ]  # fmt: skip
+    try:
+        run_cmd(command, cwd=str(project_dir), check=True)
+    except subprocess.CalledProcessError as exc:
+        print(f"  Warning: could not remove {lib_dir}: {exc}", file=sys.stderr)
+        return None
+    return command
+
+
+def _move_git_checkout(
+    project_dir: Path,
+    env: str,
+    url: str,
+    install: list[str],
+    target_sha: Optional[str],
+) -> tuple[list[list[str]], Optional[str]]:
+    """Move a git library's checkout to a new commit; (commands that succeeded, error).
+
+    Installing at another ref makes PlatformIO keep the previous checkout as a detached
+    ``<name>@src-<hash>`` copy (which a build could still pick up), and installing a ref that
+    is already present as such a copy does nothing. So detached copies of the repository are
+    removed first (so the install lands in the plain checkout), then the install runs, then
+    detached copies left behind are removed — except one at the target commit. Finally the
+    plain checkout must be at ``target_sha`` (when known), or the move failed.
+    """
+    done: list[list[str]] = []
+    for lib_dir in _git_checkouts(project_dir, env, url)[1]:
+        command = _uninstall_checkout(project_dir, env, lib_dir)
+        if command:
+            done.append(command)
+    try:
+        run_cmd(install, cwd=str(project_dir), check=True)
+    except subprocess.CalledProcessError as exc:
+        return done, f"{' '.join(install)} failed: {exc}"
+    done.append(install)
+    plain, detached = _git_checkouts(project_dir, env, url)
+    head = _git_head(plain[0]) if len(plain) == 1 else None
+    for lib_dir in detached:
+        sha = _git_head(lib_dir)
+        if _same_commit(sha, head) or _same_commit(sha, target_sha):
             continue
-        command = [
-            "pio", "pkg", "uninstall", "-d", str(project_dir), "-e", env,
-            "--library", f"file://{lib_dir}", "--no-save",
-        ]  # fmt: skip
-        run_cmd(command, cwd=str(project_dir), check=False)
-        commands.append(command)
-    return commands
+        command = _uninstall_checkout(project_dir, env, lib_dir)
+        if command:
+            done.append(command)
+    if target_sha and not _same_commit(head, target_sha):
+        where = f".pio/libdeps/{env}"
+        found = f"is at {head[:7]}" if head else "has no single checkout"
+        return done, f"{url} {found} in {where}, not {target_sha[:7]}"
+    return done, None
 
 
 def _display_path(path: Path, project_dir: Path) -> str:
@@ -2958,31 +3039,44 @@ def _env_flags(envs: list[str]) -> str:
 
 def _run_update_commands(project_dir: Path, plan: _UpdatePlan, affected: list[str]) -> bool:
     """Install/uninstall for every move; on failure report what already happened."""
-    # Platforms are installed globally: once per spec, whichever env asks first.
-    commands: dict[tuple[str, ...], list[str]] = {}
-    for command in (c for move in plan.moves for c in move.commands):
-        install_key = tuple(command[7:] if "--platform" in command else command)
-        commands.setdefault(install_key, command)
     done: list[list[str]] = []
-    for command in commands.values():
-        check = command[2] != "uninstall"  # the old version may already be gone
-        try:
-            run_cmd(list(command), cwd=str(project_dir), check=check)
-        except subprocess.CalledProcessError as exc:
-            print(f"Error: {' '.join(command)} failed: {exc}", file=sys.stderr)
-            for previous in done:
-                verb = "installed" if previous[2] == "install" else "removed"
-                print(f"  already {verb}: {previous[8]}", file=sys.stderr)
-            print(
-                f"Config files and {LOCKFILE_NAME} were NOT changed; run "
-                f"pio-lock restore {_env_flags(affected)} to return to the locked versions",
-                file=sys.stderr,
+
+    def failed(error: str) -> bool:
+        print(f"Error: {error}", file=sys.stderr)
+        for previous in done:
+            verb = "installed" if previous[2] == "install" else "removed"
+            print(f"  already {verb}: {previous[8]}", file=sys.stderr)
+        print(
+            f"Config files and {LOCKFILE_NAME} were NOT changed; run "
+            f"pio-lock restore {_env_flags(affected)} to return to the locked versions",
+            file=sys.stderr,
+        )
+        return False
+
+    seen: set[tuple[str, ...]] = set()
+    for move in plan.moves:
+        if move.git_url:
+            commands, error = _move_git_checkout(
+                project_dir, move.env, move.git_url, move.commands[0], move.target_sha
             )
-            return False
-        done.append(command)
-    for env, url in dict.fromkeys((m.env, m.git_url) for m in plan.moves if m.git_url):
-        assert url is not None
-        _remove_stale_git_copies(project_dir, env, url)
+            done.extend(commands)
+            if error:
+                return failed(error)
+            continue
+        for command in move.commands:
+            # Platforms are installed globally: once per spec, whichever env asks first.
+            key = tuple(command[7:] if "--platform" in command else command)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                run_cmd(list(command), cwd=str(project_dir), check=True)
+            except subprocess.CalledProcessError as exc:
+                if command[2] == "uninstall":  # the old version may already be gone
+                    print(f"  Warning: could not remove {command[8]}: {exc}", file=sys.stderr)
+                    continue
+                return failed(f"{' '.join(command)} failed: {exc}")
+            done.append(command)
     return True
 
 

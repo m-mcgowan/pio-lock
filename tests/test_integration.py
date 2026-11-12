@@ -616,7 +616,7 @@ class TestConfigSourceTrackerIntegration:
 
 @skip_no_pio
 class TestUpdateGitMove:
-    """Moving a git library to a new commit leaves no stale checkout behind."""
+    """Moving a git library to another commit, as update does, with real PlatformIO."""
 
     @staticmethod
     def _commit(repo: Path, header: str) -> str:
@@ -631,33 +631,59 @@ class TestUpdateGitMove:
             check=True,
         ).stdout.strip()
 
-    def test_git_move_removes_detached_checkout(self, tmp_path):
+    def _setup(self, tmp_path, library_json):
         repo = tmp_path / "repo"
         repo.mkdir()
         subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
-        (repo / "library.json").write_text('{"name": "tiny", "version": "1.0.0"}')
+        (repo / "library.json").write_text(json.dumps(library_json))
         first = self._commit(repo, "int tiny();\n")
         second = self._commit(repo, "int tiny(); int tiny2();\n")
         url = f"git+file://{repo}"
-
         project = tmp_path / "proj"
         (project / "src").mkdir(parents=True)
         (project / "src" / "main.cpp").write_text("int main() { return 0; }\n")
         (project / "platformio.ini").write_text(
             f"[env:native]\nplatform = native\nlib_deps =\n    {url}#main\n"
         )
-        for sha in (first, second):  # what update does: install the new commit, --no-save
-            subprocess.run(
-                ["pio", "pkg", "install", "-d", str(project), "-e", "native",
-                 "--library", f"{url}#{sha}", "--no-save"],
-                check=True, capture_output=True, timeout=300,
-            )  # fmt: skip
-        libdeps = project / ".pio" / "libdeps" / "native"
-        assert any("@src-" in d.name for d in libdeps.iterdir())  # PIO kept the old one
+        return project, url, first, second
 
-        removed = pio_lock._remove_stale_git_copies(project, "native", url)
-        assert len(removed) == 1
-        dirs = [d.name for d in libdeps.iterdir() if d.is_dir()]
-        assert dirs == ["tiny"]
+    @staticmethod
+    def _install(project, url, sha):
+        return ["pio", "pkg", "install", "-d", str(project), "-e", "native",
+                "--library", f"{url}#{sha}", "--no-save"]  # fmt: skip
+
+    def test_git_move_keeps_dependencies_and_leaves_one_checkout(self, tmp_path):
+        library_json = {
+            "name": "tiny",
+            "version": "1.0.0",
+            "dependencies": {"bblanchon/ArduinoJson": "6.21.5"},
+        }
+        project, url, first, second = self._setup(tmp_path, library_json)
+        subprocess.run(self._install(project, url, first), check=True, capture_output=True)
+        libdeps = project / ".pio" / "libdeps" / "native"
+        assert (libdeps / "ArduinoJson").is_dir()
+
+        done, error = pio_lock._move_git_checkout(
+            project, "native", url, self._install(project, url, second), second
+        )
+        assert error is None
+        assert sorted(d.name for d in libdeps.iterdir() if d.is_dir()) == ["ArduinoJson", "tiny"]
+        libs = {lib["name"]: lib for lib in pio_lock.scan_env_libraries(project, "native")}
+        assert libs["tiny"]["sha"] == second
+        assert any(c[2] == "uninstall" for c in done)  # the old checkout was removed
+
+    def test_git_move_back_to_a_commit_kept_as_detached_copy(self, tmp_path):
+        """B, then A (B detached), then move to B: the plain checkout must end at B."""
+        project, url, first, second = self._setup(tmp_path, {"name": "tiny", "version": "1.0.0"})
+        for sha in (second, first):
+            subprocess.run(self._install(project, url, sha), check=True, capture_output=True)
+        libdeps = project / ".pio" / "libdeps" / "native"
+        assert any("@src-" in d.name for d in libdeps.iterdir())
+
+        _done, error = pio_lock._move_git_checkout(
+            project, "native", url, self._install(project, url, second), second
+        )
+        assert error is None
+        assert [d.name for d in libdeps.iterdir() if d.is_dir()] == ["tiny"]
         libs = pio_lock.scan_env_libraries(project, "native")
         assert [(lib["name"], lib["sha"]) for lib in libs] == [("tiny", second)]
