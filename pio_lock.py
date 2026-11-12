@@ -25,9 +25,11 @@ from __future__ import annotations
 import argparse
 import configparser
 import contextlib
+import functools
 import glob
 import hashlib
 import importlib
+import inspect
 import json
 import os
 import re
@@ -38,7 +40,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Collection, Optional, Union
 
 LOCKFILE_NAME = "pio.lock.json"
 LOCK_INI_NAME = "pio.lock.ini"
@@ -619,7 +621,7 @@ def load_lockfile(path: Path) -> dict[str, Any]:
 
 
 def _read_lockfile_or_report(path: Path) -> Optional[dict[str, Any]]:
-    """The lockfile, or None after printing why it can't be read (for check and restore)."""
+    """The lockfile, or None after printing why it can't be read."""
     try:
         return load_lockfile(path)
     except (OSError, ValueError) as exc:
@@ -1092,7 +1094,7 @@ def capture(
     output_path: Optional[Path] = None,
     platform_specs: Optional[dict[str, str]] = None,
     install: bool = False,
-    keep_uninstalled: bool = False,
+    keep_uninstalled: Union[bool, Collection[str]] = False,
 ) -> int:
     """Lock each env's platform, platform packages and libraries (lockfile + pio.lock.ini).
 
@@ -1102,8 +1104,8 @@ def capture(
 
     With ``install``, an env whose platform (or one of its packages) isn't installed has it
     installed first (``PioAdapter.install_platform``, from the user's config). With
-    ``keep_uninstalled``, such an env keeps its previous platform lock with a warning instead
-    of failing the capture.
+    ``keep_uninstalled`` (True, or the env names it applies to), such an env keeps its previous
+    platform lock with a warning instead of failing the capture.
     """
     if not (project_dir / "platformio.ini").exists():
         print(f"Error: no platformio.ini in {project_dir}", file=sys.stderr)
@@ -1180,12 +1182,20 @@ def capture(
                 print(f"  Warning: {exc}", file=sys.stderr)
             keep_previous_platform(env_name, env_lock, "PlatformIO incompatible")
         except PlatformNotInstalled as exc:
-            if not keep_uninstalled:
+            keep = keep_uninstalled is True or (
+                not isinstance(keep_uninstalled, bool) and env_name in keep_uninstalled
+            )
+            if not keep:
                 print(f"Error: {exc}", file=sys.stderr)
                 return 1
             print(f"  Warning: {exc}", file=sys.stderr)
             keep_previous_platform(env_name, env_lock, "not installed")
-        except (PlatformInstallError, ValueError) as exc:
+        except PlatformInstallError as exc:
+            print(
+                f"Error: installing platform for env '{env_name}' failed: {exc}", file=sys.stderr
+            )
+            return 1
+        except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
         libraries = [
@@ -1721,6 +1731,22 @@ class PioAdapter:
         except (AttributeError, TypeError) as exc:
             raise PioIncompatible(call, self.core_version(), _describe(exc)) from exc
 
+    def _bound(self, call: str, obj: Any, method: str, *args: Any, **kwargs: Any) -> Any:
+        """``obj.method`` bound to the arguments, as a no-argument callable.
+
+        A missing method or a signature that no longer accepts the arguments is PioIncompatible;
+        what the call itself raises is left to the caller.
+        """
+        with self._calling(call):
+            func = getattr(obj, method)
+            try:
+                signature = inspect.signature(func)
+            except (TypeError, ValueError):  # builtins without a signature: can't check
+                signature = None
+            if signature is not None:
+                signature.bind(*args, **kwargs)
+        return functools.partial(func, *args, **kwargs)
+
     def core_version(self) -> str:
         try:
             return str(self._import("platformio").__version__)
@@ -1896,28 +1922,41 @@ class PioAdapter:
         self._installed_tools = {}  # what's installed is about to change
         with _chdir(project_dir):
             spec = spec or self._platform_spec(config, env)
+            # Only looking up and binding PlatformIO's API is the probe-able surface; anything
+            # raised while it installs (a TypeError deep inside included) is an install failure.
             try:
-                with self._calling("platformio.package.manager.platform.PlatformPackageManager"):
-                    # skip_dependencies and no project_env: PlatformIO neither configures the
-                    # platform from the global config nor installs packages for it.
-                    pkg = manager_cls().install(spec, skip_dependencies=True)
-                with self._calling("platformio.platform.factory.PlatformFactory.new"):
-                    platform = factory.new(pkg)
+                manager = manager_cls()
+                # skip_dependencies and no project_env: PlatformIO neither configures the
+                # platform from the global config nor installs packages for it.
+                install = self._bound(
+                    "platformio.package.manager.platform.PlatformPackageManager.install",
+                    manager,
+                    "install",
+                    spec,
+                    skip_dependencies=True,
+                )
+                pkg = install()
+                platform = self._bound(
+                    "platformio.platform.factory.PlatformFactory.new", factory, "new", pkg
+                )()
                 platform.config = config
                 platform.project_env = env
-                with self._calling(
-                    "platformio.platform.base.PlatformBase.configure_project_packages"
-                ):
-                    platform.configure_project_packages(env)
-                with self._calling(
-                    "platformio.platform.base.PlatformBase.install_required_packages"
-                ):
-                    platform.install_required_packages()
+                self._bound(
+                    "platformio.platform.base.PlatformBase.configure_project_packages",
+                    platform,
+                    "configure_project_packages",
+                    env,
+                )()
+                self._bound(
+                    "platformio.platform.base.PlatformBase.install_required_packages",
+                    platform,
+                    "install_required_packages",
+                )()
             except PioIncompatible:
                 raise
             except Exception as exc:  # PlatformIO's own errors: unknown package, network, ...
                 raise PlatformInstallError(
-                    f"could not install platform {spec} for env '{env}': {_describe(exc)}"
+                    f"could not install platform {spec}: {_describe(exc)}"
                 ) from exc
 
     def _used_packages(self, platform: Any, env: str) -> list[PackageLock]:
@@ -2603,7 +2642,7 @@ def _library_setup(project_dir: Path) -> Optional[tuple[PioAdapter, Any, bool]]:
     """(adapter, the user's config view, platforms can be checked) for outdated/update.
 
     Probes PlatformIO once: when incompatible, a warning says platforms aren't checked.
-    None after printing why the project config can't be read.
+    None after printing why the project config (or an existing lockfile) can't be read.
     """
     _pio_import_fn()  # without PlatformIO: a clear message, and exit
     adapter = _pio_adapter_factory()
@@ -2614,6 +2653,9 @@ def _library_setup(project_dir: Path) -> Optional[tuple[PioAdapter, Any, bool]]:
         config = adapter.user_config(project_dir)
     except (PioIncompatible, ProjectConfigError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
+        return None
+    lockfile_path = project_dir / LOCKFILE_NAME
+    if lockfile_path.exists() and _read_lockfile_or_report(lockfile_path) is None:
         return None
     return adapter, config, incompatible is None
 
@@ -3650,16 +3692,20 @@ def _run_update_commands(project_dir: Path, plan: _UpdatePlan, affected: list[st
     adapter: Optional[PioAdapter] = None
     for move in plan.moves:
         if move.platform_spec:
-            # Platforms are installed globally: once per spec, whichever env asks first.
-            if ("platform", move.platform_spec) in seen:
+            # Once per env, not per spec: the platform download is shared (PlatformIO skips
+            # it when installed), but which packages it needs depends on the env (framework,
+            # board, platform_packages).
+            if ("platform", move.env, move.platform_spec) in seen:
                 continue
-            seen.add(("platform", move.platform_spec))
+            seen.add(("platform", move.env, move.platform_spec))
             try:
                 adapter = adapter or _pio_adapter_factory()
                 adapter.install_platform(project_dir, move.env, move.platform_spec)
-            except (PioIncompatible, PlatformInstallError, ValueError) as exc:
+            except PlatformInstallError as exc:
+                return failed(f"installing platform for env '{move.env}' failed: {exc}")
+            except (PioIncompatible, ValueError) as exc:
                 return failed(str(exc))
-            done.append(("installed", move.platform_spec))
+            done.append(("installed", f"{move.platform_spec} for env '{move.env}'"))
             continue
         if move.git_url:
             commands, error = _move_git_checkout(
@@ -3787,14 +3833,20 @@ def update(
         print(note)
 
     platform_specs = _keep_platform_specs(project_dir, affected, adapter)
-    platform_specs.update({m.env: m.platform_spec for m in plan.moves if m.platform_spec})
-    rc = capture(project_dir, affected, platform_specs=platform_specs, keep_uninstalled=True)
+    moved = {m.env: m.platform_spec for m in plan.moves if m.platform_spec}
+    # An env whose platform update just installed must resolve: keeping its old platform
+    # would leave the lock stale on arrival. Other envs (a library moved) keep their previous
+    # platform lock, with a capture --install hint, when it isn't installed: for an already
+    # stale lock (platform = edited by hand) that is the old state, otherwise it's current.
+    keep = [env for env in affected if env not in moved]
+    platform_specs.update(moved)
+    rc = capture(project_dir, affected, platform_specs=platform_specs, keep_uninstalled=keep)
     if rc != 0:
         changed = ", ".join(dict.fromkeys(_display_path(e.path, project_dir) for e in applied))
         what = f"{changed} edited" if changed else "newer versions installed"
         print(
             f"Error: {what} but {LOCKFILE_NAME} was not updated; "
-            f"rerun pio-lock capture {_env_flags(affected)}",
+            f"rerun pio-lock capture --install {_env_flags(affected)}",
             file=sys.stderr,
         )
         return rc

@@ -391,7 +391,7 @@ pio run -t lock-restore    # restore from lockfile
 pio run -t snapshot-capture
 ```
 
-The `lock-*` targets act on the env being built: `pio run -e my_env -t lock-capture` captures `my_env` only, and without `-e` PlatformIO runs them once for each env. They don't appear in `pio run --list-targets`.
+The `lock-*` targets act on the env being built: `pio run -e my_env -t lock-capture` captures `my_env` only. Without `-e`, PlatformIO runs each env in `default_envs` (every env when `default_envs` is unset), and only envs that load pio-lock register the targets; for full coverage pass each env with `-e`, or use the CLI (`pio-lock capture -e a -e b`). They don't appear in `pio run --list-targets`.
 
 ## GitHub Actions
 

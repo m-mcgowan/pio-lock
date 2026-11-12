@@ -42,7 +42,10 @@ set up with a `lib_deps` line alone, and records the git ref you asked for. See 
 - `capture --install` installs an env's platform (and the packages it needs) from
   `platformio.ini` when it isn't installed, then captures it. With `pio.lock.ini` included this
   is how a changed `platform =` gets into the lock: `pio pkg install -e <env>` installs the
-  locked platform instead. `update` installs the platforms it moves to the same way.
+  locked platform instead. `update` installs the platforms it moves to the same way, once per
+  env (envs sharing a platform can need different packages), and fails if a moved env's
+  platform still doesn't resolve rather than keep its old lock. A failure inside PlatformIO's
+  install is reported as `installing platform for env '<env>' failed`, exit 1.
 - `check` and `restore` cover the platform and its packages; `restore` installs them before the
   libraries. `check --warn-only` reports drift as warnings and exits 0.
 - Build-time drift check: library drift, platform drift, a stale lock (`platform =` or
@@ -83,8 +86,10 @@ set up with a `lib_deps` line alone, and records the git ref you asked for. See 
 - Each locked library records its libdeps directory as `dir`.
 - `-d/--project-dir` is accepted after the subcommand as well as before it.
 - The `lock-*` targets now act on the env being built (`pio run -e <env> -t lock-capture`), so
-  another env's missing platform can't fail them; without `-e`, PlatformIO runs them once per
-  env. (0.3.x acted on every env each time.)
+  another env's missing platform can't fail them. Without `-e`, PlatformIO runs them for each
+  env in `default_envs` (every env when it is unset) that loads pio-lock; to cover every env,
+  pass each `-e` or use the CLI (`pio-lock capture -e a -e b`). (0.3.x acted on every env each
+  time.)
 - Every command checks PlatformIO's internals once at the start, so an unsupported Core is
   reported once, by the first missing piece.
 - Integration tests build real projects on the `native` platform; CI tests PlatformIO 6.1.18,
@@ -99,7 +104,8 @@ set up with a `lib_deps` line alone, and records the git ref you asked for. See 
 - An unparsable `platformio.ini` gives an error message instead of a traceback.
 - `capture` no longer crashes when the `pio` CLI isn't on `PATH`.
 - An unreadable `pio.lock.json` (for example a merge conflict) no longer crashes: `capture`
-  replaces it with a warning, `check` and `restore` exit 1 with `pio.lock.json is unreadable`.
+  replaces it with a warning; `check`, `restore`, `outdated` and `update` exit 1 with
+  `pio.lock.json is unreadable`.
 - `outdated` and `update` read `platformio.ini` independently of the working directory and take
   `libdeps_dir` from `[platformio]`.
 - `check` compared every lock entry of a library installed twice against the first directory

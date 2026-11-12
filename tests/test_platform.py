@@ -1319,7 +1319,8 @@ def test_update_edits_platform_in_shared_env_section(
     assert envs["b"]["platform"]["version"] == "6.7.0"
     out = capsys.readouterr().out
     assert out.count("edited platformio.ini: espressif32@6.6.0 => espressif32@6.7.0") == 1
-    assert fake.installed_calls == [("a", "platformio/espressif32@6.7.0")]
+    spec = "platformio/espressif32@6.7.0"
+    assert fake.installed_calls == [("a", spec), ("b", spec)]  # once per env
 
 
 def test_update_dry_run_platform_writes_nothing(
@@ -1599,7 +1600,10 @@ def test_capture_install_failure_is_an_error(
     fake = fake_pio({})
     fake.install_error = pio_lock.PlatformInstallError("could not install espressif32: offline")
     assert pio_lock.capture(tmp_project, ["testenv"], install=True) == 1
-    assert "Error: could not install espressif32: offline" in capsys.readouterr().err
+    assert (
+        "Error: installing platform for env 'testenv' failed: "
+        "could not install espressif32: offline"
+    ) in capsys.readouterr().err
     assert not (tmp_project / "pio.lock.json").exists()
 
 
@@ -1637,7 +1641,10 @@ def test_update_platform_install_failure_reports_and_keeps_lock(
     fake.install_error = pio_lock.PlatformInstallError("could not install espressif32: offline")
     assert pio_lock.update(tmp_project, ["testenv"]) == 1
     err = capsys.readouterr().err
-    assert "Error: could not install espressif32: offline" in err
+    assert (
+        "Error: installing platform for env 'testenv' failed: "
+        "could not install espressif32: offline"
+    ) in err
     assert "were NOT changed" in err
     assert _read_lock(tmp_project)["envs"]["testenv"]["platform"]["version"] == "6.6.0"
 
@@ -1750,3 +1757,131 @@ def test_capture_keep_uninstalled_keeps_previous_platform_with_hint(
     err = capsys.readouterr().err
     assert "run: pio-lock capture --install -e testenv" in err
     assert "keeping the previous lock" in err
+
+
+# ── Residual 0.4.0 fixes ─────────────────────────────────────────────────────
+
+
+def test_update_installs_a_shared_platform_spec_for_each_env(
+    tmp_project: Path, platform_update: Any
+) -> None:
+    """One platform spec, two frameworks: each env's packages need installing, so the
+    install runs per env (PlatformIO caches the platform download itself)."""
+    install, _ = platform_update
+    (tmp_project / "platformio.ini").write_text(
+        "[env]\nplatform = espressif32@6.6.0\n"
+        "[env:a]\nframework = arduino\n[env:b]\nframework = espidf\n"
+    )
+    fake = install({"a": _lock(), "b": _lock()})
+    assert pio_lock.capture(tmp_project, ["a", "b"]) == 0
+    _move_to(fake, "6.7.0")
+    assert pio_lock.update(tmp_project, ["a", "b"]) == 0
+    spec = "platformio/espressif32@6.7.0"
+    assert fake.installed_calls == [("a", spec), ("b", spec)]
+    envs = _read_lock(tmp_project)["envs"]
+    assert envs["a"]["platform"]["version"] == "6.7.0"
+    assert envs["b"]["platform"]["version"] == "6.7.0"
+
+
+def test_update_moved_env_still_not_installed_is_an_error(
+    tmp_project: Path, platform_update: Any, capsys: Any
+) -> None:
+    """The install 'succeeded' but the env still doesn't resolve: keeping the old platform
+    lock would make the lock stale on arrival, so update fails honestly."""
+    install, _ = platform_update
+    (tmp_project / "platformio.ini").write_text("[env:testenv]\nplatform = espressif32@6.6.0\n")
+    fake = install({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    fake.latest_versions = {"espressif32": "6.7.0"}  # offered, but installing doesn't resolve
+    fake.in_use = {"testenv": ("espressif32", "6.6.0")}
+    del fake.platforms["testenv"]
+    capsys.readouterr()
+    assert pio_lock.update(tmp_project, ["testenv"]) == 1
+    err = capsys.readouterr().err
+    assert "Error: platform for env 'testenv' is not installed" in err
+    assert (
+        "platformio.ini edited but pio.lock.json was not updated; "
+        "rerun pio-lock capture --install -e testenv"
+    ) in err
+    assert _read_lock(tmp_project)["envs"]["testenv"]["platform"]["version"] == "6.6.0"
+
+
+def test_capture_keep_uninstalled_only_for_listed_envs(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    """update keeps the previous platform only for envs whose lock was already stale; an env
+    not listed fails as a plain capture would."""
+    fake = fake_pio({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    del fake.platforms["testenv"]
+    assert pio_lock.capture(tmp_project, ["testenv"], keep_uninstalled=["other"]) == 1
+    assert "Error: platform for env 'testenv' is not installed" in capsys.readouterr().err
+    assert pio_lock.capture(tmp_project, ["testenv"], keep_uninstalled=["testenv"]) == 0
+    assert "keeping the previous lock" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["outdated", "update"])
+def test_outdated_and_update_report_an_unreadable_lockfile(
+    tmp_project: Path, platform_update: Any, capsys: Any, command: str
+) -> None:
+    install, _ = platform_update
+    install({"testenv": _lock()})
+    (tmp_project / "pio.lock.json").write_text(_CONFLICTED)
+    assert getattr(pio_lock, command)(tmp_project, ["testenv"]) == 1
+    err = capsys.readouterr().err
+    assert "Error: pio.lock.json is unreadable: " in err
+    assert "Traceback" not in err
+
+
+def test_real_adapter_install_type_error_inside_platformio_is_an_install_failure(
+    tmp_path: Path,
+) -> None:
+    """A TypeError raised while PlatformIO installs is an install failure, not an API
+    mismatch: only the lookups and signature binding are probe-able surface."""
+    modules, _record = _install_stubs()
+    manager = modules["platformio.package.manager.platform"].PlatformPackageManager
+
+    def install(self: Any, spec: Any, skip_dependencies: bool = False, **kwargs: Any) -> Any:
+        raise TypeError("unsupported operand type(s) for +: 'NoneType' and 'str'")
+
+    manager.install = install
+
+    class _Adapter(_StubAdapter):
+        def user_config(self, project_dir: Path) -> Any:
+            return _UserView()
+
+    with pytest.raises(pio_lock.PlatformInstallError, match="NoneType"):
+        _Adapter(modules).install_platform(tmp_path, "esp32")
+
+
+def test_real_adapter_install_signature_change_is_incompatible(tmp_path: Path) -> None:
+    modules, _record = _install_stubs()
+    manager = modules["platformio.package.manager.platform"].PlatformPackageManager
+
+    def install(self: Any, spec: Any) -> Any:  # no skip_dependencies any more
+        raise AssertionError("not called with an incompatible signature")
+
+    manager.install = install
+
+    class _Adapter(_StubAdapter):
+        def user_config(self, project_dir: Path) -> Any:
+            return _UserView()
+
+    with pytest.raises(PioIncompatible):
+        _Adapter(modules).install_platform(tmp_path, "esp32")
+
+
+def test_capture_install_type_error_inside_platformio_fails(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    fake = fake_pio({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    del fake.platforms["testenv"]
+    fake.install_error = pio_lock.PlatformInstallError(
+        "could not install platform espressif32: TypeError: boom"
+    )
+    assert pio_lock.capture(tmp_project, ["testenv"], install=True) == 1
+    assert (
+        "Error: installing platform for env 'testenv' failed: "
+        "could not install platform espressif32: TypeError: boom"
+    ) in capsys.readouterr().err

@@ -780,7 +780,7 @@ class TestUpdate:
         assert "acme/Foo @ ^1.2.0" in (tmp_path / "platformio.ini").read_text()
         err = capsys.readouterr().err
         assert "platformio.ini edited but pio.lock.json was not updated" in err
-        assert "pio-lock capture -e test" in err
+        assert "pio-lock capture --install -e test" in err
 
     def test_update_names_other_envs_sharing_an_edited_spec(self, tmp_path, mock_pio, capsys):
         block = "lib_deps =\n    acme/Foo @ ^1.0.0\n"
@@ -997,7 +997,7 @@ class TestUpdate:
         assert pio_lock.update(tmp_path, ["test"]) == 0
         kwargs = mock_pio.capture_kwargs[-1]
         assert "test" not in (kwargs["platform_specs"] or {})
-        assert kwargs["keep_uninstalled"] is True
+        assert "test" in kwargs["keep_uninstalled"]
 
 
 # ── Tests for ConfigSourceTracker ─────────────────────────────────────────────
