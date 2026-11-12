@@ -148,7 +148,7 @@ flowchart LR
     script -- "drift check" --> build
 ```
 
-`extra_configs = pio.lock.ini` is optional. Without it, the platform floats as in 0.3.x, and builds print a hint once a 0.4.0 lock exists.
+`extra_configs = pio.lock.ini` is optional. Without it, the platform floats as in 0.3.x: builds and `pio-lock check` don't compare the platform, and print a hint to add the include once a 0.4.0 lock exists.
 
 ## Pinning the platform
 
@@ -183,6 +183,16 @@ Or let `pio-lock init` add it. `init` creates `[platformio]` / `extra_configs` i
 
 To stop pinning the platform, remove `pio.lock.ini` from `extra_configs`.
 
+### Changing the platform
+
+With the include in place, PlatformIO (`pio run`, `pio pkg install -e <env>`) uses the platform `pio.lock.ini` pins, not the `platform =` you just edited. To move to the new one, run:
+
+```bash
+pio-lock capture --install -e my_env
+```
+
+`--install` installs the platform your `platformio.ini` names, and the packages it needs, when it isn't installed yet — configured from your `platformio.ini`, not from `pio.lock.ini` — then records it in the lock. (`pio-lock update` installs the platforms it moves to the same way.)
+
 ### A later config file overriding the lock
 
 PlatformIO reads config files in order and the last value wins. If a file read after `pio.lock.ini` sets `platform` or `platform_packages` for a locked env, that file silently undoes the lock. pio-lock reports this as an error:
@@ -198,7 +208,7 @@ Move `pio.lock.ini` last in `extra_configs`, or, if the override is deliberate, 
 custom_pio_lock_allow_override = true
 ```
 
-or set `PIO_LOCK_ALLOW_OVERRIDE=1` in the environment. Allowed overrides are still reported, as warnings. (`pio-lock check` reads only the environment variable.)
+or set `PIO_LOCK_ALLOW_OVERRIDE=1` (or `true` / `yes`) in the environment. Allowed overrides are still reported, as warnings. (`pio-lock check` reads only the environment variable.)
 
 ## What a plain `pio run` pins
 
@@ -238,9 +248,9 @@ When pio-lock is loaded (any [setup](#setup)), every build compares the env bein
 | PlatformIO Core version differs from the locked one | warning | warning |
 | pio-lock can't read PlatformIO's internals (unsupported Core) | warning, libraries still checked | **build fails** (unless the drift policy is `warn`) |
 
-The build can't switch platforms or libraries while it runs, so the fix is to install the locked versions and re-run — the message says which command to use (`pio-lock restore -e <env>`, or `pio-lock capture -e <env>` when you changed `platformio.ini` on purpose).
+The build can't switch platforms or libraries while it runs, so the fix is to install the locked versions and re-run — the message says which command to use (`pio-lock restore -e <env>`, or `pio-lock capture --install -e <env>` when you changed `platformio.ini` on purpose).
 
-The checks don't run when you ask for one of pio-lock's own targets (`lock-*`, `snapshot-*`): those exist to record, repair or report drift.
+The checks don't run when you ask for one of pio-lock's own targets (`lock-*`, `snapshot-*`) — those exist to record, repair or report drift — or for `clean`, `cleanall` or `fullclean`.
 
 **Release mode** is on when any of these is set: `PIO_RELEASE_BUILD=1` in the environment, `custom_reproducible_release = true` in `platformio.ini`, or a pinned build snapshot (`"pinned": true` in `build_snapshot.json`).
 
@@ -256,11 +266,11 @@ An empty answer aborts. This includes IDE task terminals (VS Code), where the bu
 
 | `platformio.ini` option | Environment variable | Values | Default |
 |---|---|---|---|
-| `custom_pio_lock_drift` | `PIO_LOCK_DRIFT` | `fail`, `warn` | `fail` (in release mode; outside it drift always warns) |
-| `custom_pio_lock_allow_override` | `PIO_LOCK_ALLOW_OVERRIDE` | `true` / `1` | off: a later config overriding the lock is drift |
+| `custom_pio_lock_drift` | `PIO_LOCK_DRIFT` | `fail`, `warn` (any case) | `fail` (in release mode; outside it drift always warns) |
+| `custom_pio_lock_allow_override` | `PIO_LOCK_ALLOW_OVERRIDE` | `true`, `1` or `yes` (any case); the variable also takes `false`, `0` or `no` to turn it off over the option | off: a later config overriding the lock is drift |
 | `custom_reproducible_release` | `PIO_RELEASE_BUILD` | `true` (option) / `1` (variable) | off |
 
-The environment variable wins over the `platformio.ini` option.
+The environment variable wins over the `platformio.ini` option. An unrecognised value is ignored: the option, then the default, applies.
 
 ### Turning errors into warnings
 
@@ -314,13 +324,15 @@ To resolve either, make the requirements agree so only one copy is installed, th
 - Exact pins (`@6.6.0`) move within the same major version; crossing a major needs `--beyond-range`.
 - Partial versions (`@6`, `@6.6`) are ranges: the lock moves within them and the ini is left as written.
 - A spec pio-lock can't rewrite (for example `>=1,<2`) is left as written while the lock moves within it; a `--beyond-range` move past such a spec is reported with `edit the ini by hand` and not made.
+- With `--lock-only`, a library never moves outside what its `lib_deps` spec allows — past the range, off an exact pin (`@1.0.0`), or to another git tag — because a plain `pio run` still enforces `lib_deps` and would install a second, matching copy. Such a move is reported with `edit the ini (or drop --lock-only)` and not made; moves within the range still happen. Platforms can move with `--lock-only`: `pio.lock.ini` overrides their spec.
 - If the edited line sits in a section other envs share (`[env]`, or a base section), `update` names those envs and tells you to run `pio-lock update -e <env>` for them, so their locks catch up.
 - Old git checkouts are cleaned up after a move.
+- An env whose `platform =` changed since the last capture isn't held at its old locked platform: `update` records the platform your spec now resolves to, or, if that isn't installed, keeps the old lock and says to run `pio-lock capture --install -e <env>`.
 
 | Flag | Effect |
 |---|---|
 | `--dry-run` | Show what would change; install nothing, write nothing |
-| `--lock-only` | Move only the lock (`pio.lock.json`, `pio.lock.ini`); leave `platformio.ini` alone |
+| `--lock-only` | Move only the lock (`pio.lock.json`, `pio.lock.ini`); leave `platformio.ini` alone. Libraries only move within what `lib_deps` allows |
 | `--beyond-range` | Also move to versions outside the range `platformio.ini` declares |
 | `--lib NAME` | Update only libraries matching `NAME` (platforms are left alone) |
 | `--apply` | Deprecated, does nothing: `update` applies by default |
@@ -358,9 +370,9 @@ pio-lock init
 
 | Command | Does |
 |---|---|
-| `capture -e ENV…` | Record what's installed for each env in `pio.lock.json` and regenerate `pio.lock.ini`. No network, no installs; an env whose platform isn't installed is an error (run `pio pkg install -e <env>` first). Other envs' entries are kept; envs no longer in `platformio.ini` are pruned. If pio-lock can't read PlatformIO's internals, it keeps the env's previous platform lock and warns. `--output PATH` writes elsewhere |
+| `capture -e ENV…` | Record what's installed for each env in `pio.lock.json` and regenerate `pio.lock.ini`. No network, no installs; an env whose platform isn't installed is an error. `--install` installs it first, from your `platformio.ini` (see [Changing the platform](#changing-the-platform)). Other envs' entries are kept; envs no longer in `platformio.ini` are pruned. If pio-lock can't read PlatformIO's internals, it keeps the env's previous platform lock and warns. An unreadable `pio.lock.json` (a merge conflict, say) is replaced, with a warning. `--output PATH` writes elsewhere |
 | `restore -e ENV…` | Install the locked platform and packages, then the locked libraries |
-| `check -e ENV…` | Compare installed platform, packages and libraries with the lock; exit 1 on drift. `--warn-only` reports and exits 0 |
+| `check -e ENV…` | Compare installed platform, packages and libraries with the lock; exit 1 on drift. The platform is compared only with `pio.lock.ini` included, as in the build. `--warn-only` reports and exits 0 |
 | `outdated -e ENV…` | Report newer versions (`--json` for machine-readable output); exit 1 when updates exist |
 | `update -e ENV…` | Move the lock (and `platformio.ini` within range) forward — see [Updating](#updating) |
 | `init` | Add `pio.lock.ini` to `[platformio] extra_configs` (`--dry-run` previews) |
@@ -379,7 +391,7 @@ pio run -t lock-restore    # restore from lockfile
 pio run -t snapshot-capture
 ```
 
-The `lock-*` targets act on every env in `platformio.ini`. They don't appear in `pio run --list-targets`.
+The `lock-*` targets act on the env being built: `pio run -e my_env -t lock-capture` captures `my_env` only, and without `-e` PlatformIO runs them once for each env. They don't appear in `pio run --list-targets`.
 
 ## GitHub Actions
 

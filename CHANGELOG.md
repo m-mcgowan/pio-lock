@@ -39,13 +39,19 @@ set up with a `lib_deps` line alone, and records the git ref you asked for. See 
   exact versions; packages installed from local `file://` paths are recorded and checked but
   left out of `pio.lock.ini`.
 - `pio-lock init` adds `pio.lock.ini` to `extra_configs` (`--dry-run` previews).
+- `capture --install` installs an env's platform (and the packages it needs) from
+  `platformio.ini` when it isn't installed, then captures it. With `pio.lock.ini` included this
+  is how a changed `platform =` gets into the lock: `pio pkg install -e <env>` installs the
+  locked platform instead. `update` installs the platforms it moves to the same way.
 - `check` and `restore` cover the platform and its packages; `restore` installs them before the
   libraries. `check --warn-only` reports drift as warnings and exits 0.
 - Build-time drift check: library drift, platform drift, a stale lock (`platform =` or
   `platform_packages` changed since capture) and a PlatformIO Core version mismatch (warning
   only). Outside release mode drift warns; in a terminal the build asks whether to continue
   (also in IDE task terminals — `PIO_LOCK_DRIFT=warn` skips the prompt). An env missing from the
-  lock, a v1 lock or a missing `pio.lock.ini` include only print a hint.
+  lock prints a hint; with a v1 lock or without the `pio.lock.ini` include, libraries are still
+  checked and the platform is skipped with a hint (`pio-lock check` does the same). `clean`,
+  `cleanall` and `fullclean` skip the checks.
 - `lib_deps` alone sets pio-lock up: `library.json` loads `pio_lock.py` as the library's
   extra script. pio-lock is loaded once per build, however many entry points name it.
 - `pip install pio-lock` gives a `pio-lock` command. When `platformio` isn't importable from
@@ -58,7 +64,12 @@ set up with a `lib_deps` line alone, and records the git ref you asked for. See 
   range also rewrite the ini in the style written (`^1.8.3` → `^1.8.5`); exact pins move within
   the same major; `--beyond-range` crosses the declared range; specs it can't rewrite are
   reported for a hand edit; edits to a section shared with other envs name those envs. Old git
-  checkouts are removed after a move. This follows pnpm / Yarn 2+ rather than Cargo / npm.
+  checkouts are removed after a move. With `--lock-only`, a library is never moved outside what
+  its `lib_deps` spec allows (past the range, off an exact pin, or to another git tag) — a plain
+  `pio run` would install a second, matching copy — and the move is reported instead. An env
+  whose `platform =` changed since capture records the platform it now resolves to (or keeps its
+  old lock with a `capture --install` hint), never the new spec at the old version. This follows
+  pnpm / Yarn 2+ rather than Cargo / npm.
 - `capture -e <env>` updates only that env's entries and prunes envs no longer in
   `platformio.ini`; pio-lock itself is left out of the library list. If PlatformIO's internals
   are incompatible, the previous platform lock is kept with a warning.
@@ -71,6 +82,11 @@ set up with a `lib_deps` line alone, and records the git ref you asked for. See 
   library copies".
 - Each locked library records its libdeps directory as `dir`.
 - `-d/--project-dir` is accepted after the subcommand as well as before it.
+- The `lock-*` targets now act on the env being built (`pio run -e <env> -t lock-capture`), so
+  another env's missing platform can't fail them; without `-e`, PlatformIO runs them once per
+  env. (0.3.x acted on every env each time.)
+- Every command checks PlatformIO's internals once at the start, so an unsupported Core is
+  reported once, by the first missing piece.
 - Integration tests build real projects on the `native` platform; CI tests PlatformIO 6.1.18,
   6.2.x and latest, plus a weekly run. `make test-pio PIO=<version>` runs them locally against
   any PlatformIO version in isolated directories.
@@ -82,6 +98,10 @@ set up with a `lib_deps` line alone, and records the git ref you asked for. See 
   `build_snapshot.json` first, which hid the staleness `snapshot-check` exists to report.
 - An unparsable `platformio.ini` gives an error message instead of a traceback.
 - `capture` no longer crashes when the `pio` CLI isn't on `PATH`.
+- An unreadable `pio.lock.json` (for example a merge conflict) no longer crashes: `capture`
+  replaces it with a warning, `check` and `restore` exit 1 with `pio.lock.json is unreadable`.
+- `outdated` and `update` read `platformio.ini` independently of the working directory and take
+  `libdeps_dir` from `[platformio]`.
 - `check` compared every lock entry of a library installed twice against the first directory
   found, giving a permanent `DRIFT: … expected <version>` (or a SHA that depended on directory
   order); duplicated libraries now get the duplicate warning instead, and entries are compared

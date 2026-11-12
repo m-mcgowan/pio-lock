@@ -277,8 +277,10 @@ def snapshot_auto_manage(project_dir: Path, env: Any = None, *, checks: bool = T
     Called from the PIO extra_script hook. Sets SOURCE_DATE_EPOCH so that
     __DATE__ and __TIME__ macros are deterministic across rebuilds.
 
-    With ``checks=False`` (a lock/snapshot target was requested) a missing or stale
-    snapshot never aborts the run: it is regenerated and applied instead.
+    With ``checks=False`` (a lock/snapshot target was requested) nothing is checked and
+    ``build_snapshot.json`` is never written: an existing snapshot is applied as it is (even if
+    stale), and a missing one is computed in memory and applied. The target then sees, and can
+    report or fix, the real state.
     """
     snapshot = load_snapshot(project_dir)
     release = _is_release_mode(snapshot, env)
@@ -4376,7 +4378,7 @@ def init(project_dir: Path, dry_run: bool = False) -> int:
     if not ini_path.is_file():
         print(f"Error: {ini_path} not found", file=sys.stderr)
         return 1
-    with open(ini_path, newline="") as f:
+    with open(ini_path, encoding="utf-8", newline="") as f:
         original = f.read()
     nl = "\r\n" if "\r\n" in original else "\n"
     lines = original.splitlines(keepends=True)
@@ -4437,7 +4439,7 @@ def init(project_dir: Path, dry_run: bool = False) -> int:
     print(f"{verb} {LOCK_INI_NAME} to extra_configs in {ini_path}:")
     print(f"  {changed.rstrip()}")
     if not dry_run:
-        with open(ini_path, "w", newline="") as f:
+        with open(ini_path, "w", encoding="utf-8", newline="") as f:
             f.write("".join(lines))
     return 0
 
