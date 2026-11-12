@@ -1533,7 +1533,7 @@ def _load_origin(env: Any) -> str:
     try:
         if env.get("PIOBUILDER") is not None or env.get("_PIO_LIB_BUILDER"):
             return "library"
-    except Exception:  # noqa: BLE001 - fakes/other envs without get()
+    except Exception:
         pass
     try:
         libdeps = env.subst("$PROJECT_LIBDEPS_DIR")
@@ -1541,7 +1541,7 @@ def _load_origin(env: Any) -> str:
         if libdeps and here.startswith(str(Path(libdeps).resolve()) + os.sep):
             # Under libdeps and not a project-level script line.
             return "library"
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return "extra_scripts"
 
