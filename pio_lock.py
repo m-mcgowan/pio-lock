@@ -216,14 +216,45 @@ def apply_snapshot(snapshot: dict[str, Any]) -> None:
     print(f"Build snapshot: SOURCE_DATE_EPOCH={epoch} ({build_date}, commit {commit}{tag})")
 
 
-def snapshot_auto_manage(project_dir: Path, env: Any = None) -> None:
+LOCK_TARGETS = frozenset(
+    {
+        "lock-capture",
+        "lock-check",
+        "lock-restore",
+        "snapshot-capture",
+        "snapshot-check",
+        "snapshot-clear",
+        "snapshot-print",
+    }
+)
+
+
+def _requested_targets(env: Any) -> set[str]:
+    """Return the targets requested on the command line (empty if unavailable)."""
+    try:
+        from SCons.Script import COMMAND_LINE_TARGETS  # type: ignore[import-not-found]
+
+        return {str(t) for t in COMMAND_LINE_TARGETS}
+    except Exception:
+        return set()
+
+
+def _is_lock_target_run(targets: set[str]) -> bool:
+    """True if any requested target is one of pio-lock's own targets."""
+    return bool(targets & LOCK_TARGETS)
+
+
+def snapshot_auto_manage(project_dir: Path, env: Any = None, *, checks: bool = True) -> None:
     """Auto-manage the snapshot during builds.
 
     Called from the PIO extra_script hook. Sets SOURCE_DATE_EPOCH so that
     __DATE__ and __TIME__ macros are deterministic across rebuilds.
+
+    With ``checks=False`` (a lock/snapshot target was requested) a missing or stale
+    snapshot never aborts the run: it is regenerated and applied instead.
     """
     snapshot = load_snapshot(project_dir)
-    release = _is_release_mode(snapshot, env)
+    release = checks and _is_release_mode(snapshot, env)
 
     if snapshot is None:
         if release:
@@ -1552,7 +1583,7 @@ def register_pio_targets(env: Any) -> None:
         )
 
     # Auto-manage snapshot on every build
-    snapshot_auto_manage(project_dir, env)
+    snapshot_auto_manage(project_dir, env, checks=not _is_lock_target_run(_requested_targets(env)))
 
 
 # Auto-register targets when loaded as a PIO extra_script
