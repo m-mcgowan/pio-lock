@@ -149,8 +149,13 @@ def load_snapshot(project_dir: Path) -> Optional[dict[str, Any]]:
         return None
 
 
-def generate_snapshot(project_dir: Path, *, pinned: bool = False) -> dict[str, Any]:
-    """Generate a new build snapshot from the current state."""
+def generate_snapshot(
+    project_dir: Path, *, pinned: bool = False, write: bool = True
+) -> dict[str, Any]:
+    """Generate a new build snapshot from the current state.
+
+    With ``write=False`` the snapshot is computed but not written to disk.
+    """
     commit = get_git_commit(project_dir)
     dirty = is_git_dirty(project_dir)
     commit_epoch = None if dirty else get_commit_epoch(project_dir)
@@ -178,8 +183,8 @@ def generate_snapshot(project_dir: Path, *, pinned: bool = False) -> dict[str, A
     if dirty:
         print("WARNING: Working tree has uncommitted changes", file=sys.stderr)
 
-    path = project_dir / SNAPSHOT_NAME
-    _atomic_write_json(path, snapshot)
+    if write:
+        _atomic_write_json(project_dir / SNAPSHOT_NAME, snapshot)
     dirty_marker = "*" if dirty else ""
     print(f"Build snapshot generated: {snapshot['build_date']} (commit {commit}{dirty_marker})")
     return snapshot
@@ -235,7 +240,7 @@ def _requested_targets(env: Any) -> set[str]:
         from SCons.Script import COMMAND_LINE_TARGETS  # type: ignore[import-not-found]
 
         return {str(t) for t in COMMAND_LINE_TARGETS}
-    except Exception:
+    except ImportError:
         return set()
 
 
@@ -254,7 +259,15 @@ def snapshot_auto_manage(project_dir: Path, env: Any = None, *, checks: bool = T
     snapshot never aborts the run: it is regenerated and applied instead.
     """
     snapshot = load_snapshot(project_dir)
-    release = checks and _is_release_mode(snapshot, env)
+    release = _is_release_mode(snapshot, env)
+
+    if not checks:
+        # A lock/snapshot target is running: never touch build_snapshot.json, so the target
+        # sees the real state. Apply what exists, or an in-memory snapshot if none does.
+        if snapshot is None:
+            snapshot = generate_snapshot(project_dir, write=False)
+        apply_snapshot(snapshot)
+        return
 
     if snapshot is None:
         if release:
@@ -1583,7 +1596,8 @@ def register_pio_targets(env: Any) -> None:
         )
 
     # Auto-manage snapshot on every build
-    snapshot_auto_manage(project_dir, env, checks=not _is_lock_target_run(_requested_targets(env)))
+    checks = not _is_lock_target_run(_requested_targets(env))
+    snapshot_auto_manage(project_dir, env, checks=checks)
 
 
 # Auto-register targets when loaded as a PIO extra_script
