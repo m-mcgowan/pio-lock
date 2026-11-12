@@ -87,8 +87,9 @@ jobs:
     strategy:
       matrix:
         pio-version:
-          - "platformio"            # latest stable
-          - "platformio>=6.1,<6.2"  # current major
+          - "platformio==6.1.18"     # oldest supported 6.1.x
+          - "platformio>=6.2,<6.3"   # 6.2.x
+          - "platformio"             # latest stable
     steps:
       - uses: actions/checkout@v4
 

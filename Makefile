@@ -1,6 +1,6 @@
 VENV := .venv/bin
 
-.PHONY: help setup lint test test-cov test-all act clean
+.PHONY: help setup lint test test-cov test-all test-pio act clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -26,8 +26,15 @@ test-cov: ## Run unit tests with coverage report
 test-all: ## Run all tests including integration (needs PIO)
 	$(VENV)/python -m pytest -v
 
+test-pio: ## Run integration tests on one PlatformIO version in isolated dirs (make test-pio PIO=6.2.0)
+	@test -n "$(PIO)" || { echo "usage: make test-pio PIO=<platformio version>"; exit 2; }
+	python3 -m venv .venv-pio-$(PIO)
+	.venv-pio-$(PIO)/bin/pip install -q "platformio==$(PIO)" pytest
+	PLATFORMIO_CORE_DIR=$(CURDIR)/.pio-core-$(PIO) PATH=$(CURDIR)/.venv-pio-$(PIO)/bin:$$PATH \
+		.venv-pio-$(PIO)/bin/python -m pytest -m integration -v
+
 act: ## Run full CI locally via act
 	act --container-architecture linux/amd64
 
 clean: ## Remove build artifacts and caches
-	rm -rf .venv .mypy_cache .pytest_cache .ruff_cache __pycache__ tests/__pycache__ *.egg-info dist build htmlcov reports .coverage
+	rm -rf .venv .venv-pio-* .pio-core-* .mypy_cache .pytest_cache .ruff_cache __pycache__ tests/__pycache__ *.egg-info dist build htmlcov reports .coverage

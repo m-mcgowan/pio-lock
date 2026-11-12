@@ -15,5 +15,7 @@ reports/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.venv-pio-*/
+.pio-core-*/
 # Also ignore generated lockfiles inside fixtures
 tests/fixtures/*/pio.lock.json

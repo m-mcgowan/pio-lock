@@ -4,6 +4,8 @@ on:
   schedule:
     # 04:00 UTC daily
     - cron: "0 4 * * *"
+    # 05:00 UTC every Monday: weekly run, never skipped
+    - cron: "0 5 * * 1"
   workflow_dispatch:
 
 jobs:
@@ -20,6 +22,11 @@ jobs:
       - name: Check for recent commits
         id: check
         run: |
+          if [ "${{ github.event.schedule }}" = "0 5 * * 1" ]; then
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+            echo "Weekly scheduled run — always runs"
+            exit 0
+          fi
           recent=$(git log --oneline --since="24 hours ago" | head -1)
           if [ -n "$recent" ]; then
             echo "has-changes=true" >> "$GITHUB_OUTPUT"
@@ -36,8 +43,9 @@ jobs:
     strategy:
       matrix:
         pio-version:
-          - "platformio"            # latest stable
-          - "platformio>=6.1,<6.2"  # current major
+          - "platformio==6.1.18"     # oldest supported 6.1.x
+          - "platformio>=6.2,<6.3"   # 6.2.x
+          - "platformio"             # latest stable
     steps:
       - uses: actions/checkout@v4
 
