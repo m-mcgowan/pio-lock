@@ -700,3 +700,50 @@ def test_register_adds_prelink_check_except_for_lock_targets(
     monkeypatch.setattr(other, "subst", lambda v: subst.get(v, v))
     pio_lock.register_pio_targets(other)
     assert other.pre_actions == []
+
+
+# ── lock-* targets act on the env being built; clean runs skip the checks ────
+
+
+def test_lock_targets_act_on_the_env_being_built(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`pio run -e a -t lock-capture` must not touch env b (whose platform may be missing);
+    `pio run -t lock-capture` runs once per env anyway."""
+    calls: list[tuple[str, list[str]]] = []
+    for name in ("capture", "check", "restore"):
+        monkeypatch.setattr(
+            pio_lock, name, lambda _p, envs, *a, _n=name, **k: calls.append((_n, envs)) or 0
+        )
+    monkeypatch.setattr(pio_lock, "snapshot_auto_manage", lambda *a, **k: None)
+    monkeypatch.setattr(pio_lock, "build_checks", lambda *a, **k: None)
+    monkeypatch.setattr(pio_lock, "_register_link_check", lambda *a, **k: None)
+    monkeypatch.setattr(pio_lock, "_requested_targets", lambda _env: {"lock-capture"})
+    env = FakeEnv()
+    actions: dict[str, Any] = {}
+    monkeypatch.setattr(
+        env, "AddCustomTarget", lambda name, _deps, action, **kw: actions.__setitem__(name, action)
+    )
+    monkeypatch.setattr(
+        env, "subst", lambda v: {"$PROJECT_DIR": str(project), "$PIOENV": "a"}.get(v, v)
+    )
+    env.GetProjectConfig = lambda: type("C", (), {"envs": lambda self: ["a", "b"]})()  # type: ignore[attr-defined]
+    pio_lock.register_pio_targets(env)
+    for target in ("lock-capture", "lock-check", "lock-restore"):
+        actions[target]()
+    assert calls == [("capture", ["a"]), ("check", ["a"]), ("restore", ["a"])]
+
+
+@pytest.mark.parametrize("clean", [True, False])
+def test_clean_run_skips_drift_checks(
+    build: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any, clean: bool
+) -> None:
+    """`pio run -t clean` reaches SCons as --clean (no target): it must not stop on drift."""
+    build.release()
+    build.drift_library()
+    monkeypatch.setattr(
+        build.env, "GetOption", lambda name: clean if name == "clean" else None, raising=False
+    )
+    assert build.run() == ([] if clean else [1])
+    if clean:
+        assert capsys.readouterr().out == ""

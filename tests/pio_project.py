@@ -36,7 +36,14 @@ requires_pio = pytest.mark.skipif(not have_pio(), reason="PlatformIO CLI not ava
 
 
 def _git(project: Path, *args: str) -> None:
-    identity = ["-c", "user.name=Test", "-c", "user.email=test@example.com"]
+    identity = [
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "commit.gpgsign=false",
+    ]
     subprocess.run(
         ["git", *identity, "-C", str(project), *args],
         check=True,

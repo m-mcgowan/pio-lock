@@ -671,6 +671,20 @@ def test_capture_install_records_a_changed_platform(tmp_path: Path) -> None:
 
 
 @requires_pio
+def test_lock_capture_target_acts_on_the_selected_env_only(tmp_path: Path) -> None:
+    """Another env whose platform isn't installed must not fail `-e native -t lock-capture`."""
+    p = make_native_project(tmp_path / "proj", "[env:native]\nplatform = native\n")
+    lib = piolock_lib(p)
+    (p / "platformio.ini").write_text(
+        f"[env:native]\nplatform = native\nextra_scripts = pre:{lib}/pio_lock.py\n"
+        "[env:other]\nplatform = pio-lock-not-installed\n"
+    )
+    result = run_pio(p, "run", "-e", "native", "-t", "lock-capture")
+    assert result.returncode == 0, result.stdout
+    assert list(_lockfile(p)["envs"]) == ["native"]
+
+
+@requires_pio
 def test_release_build_drift_env_var_warns(tmp_path: Path) -> None:
     p, env_body = _locked_build_project(tmp_path)
     _set_env(p, env_body, "native@*")

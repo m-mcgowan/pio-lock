@@ -256,6 +256,21 @@ def _is_lock_target_run(targets: set[str]) -> bool:
     return bool(targets & LOCK_TARGETS)
 
 
+# PlatformIO's clean targets (platformio/run/helpers.py, 6.1 and 6.2). They reach SCons as
+# ``--clean`` rather than as targets, so ``_is_clean_run`` also asks SCons.
+CLEAN_TARGETS = frozenset({"clean", "cleanall", "fullclean"})
+
+
+def _is_clean_run(env: Any, targets: set[str]) -> bool:
+    """True when the run only cleans (``pio run -t clean|cleanall|fullclean``)."""
+    if targets & CLEAN_TARGETS:
+        return True
+    try:
+        return bool(env.GetOption("clean"))
+    except Exception:
+        return False
+
+
 def snapshot_auto_manage(project_dir: Path, env: Any = None, *, checks: bool = True) -> None:
     """Auto-manage the snapshot during builds.
 
@@ -3899,12 +3914,14 @@ def _ask_to_continue() -> bool:
 def build_checks(project_dir: Path, env_name: str, env: Any) -> None:
     """Compare the env being built with pio.lock.json; warn, prompt, or stop the build.
 
-    Runs from the build hook on every normal build (never for pio-lock's own targets).
+    Runs from the build hook on every normal build (never for pio-lock's own targets or a
+    clean).
     Drift fails a release build unless the drift policy is ``warn``; outside release mode it
     warns, and in an interactive terminal asks whether to continue. The build can't switch
     platforms or libraries itself, so the guidance is to install (restore) and re-run.
     """
-    if _is_lock_target_run(_requested_targets(env)):
+    targets = _requested_targets(env)
+    if _is_lock_target_run(targets) or _is_clean_run(env, targets):
         return
     if not (Path(project_dir) / LOCKFILE_NAME).exists():
         return
@@ -4040,7 +4057,8 @@ def _link_checks(project_dir: Path, env_name: str, env: Any) -> int:
 
 def _register_link_check(project_dir: Path, env_name: str, env: Any) -> None:
     """Run link_checks just before the program is linked (not for pio-lock's own targets)."""
-    if _is_lock_target_run(_requested_targets(env)):
+    targets = _requested_targets(env)
+    if _is_lock_target_run(targets) or _is_clean_run(env, targets):
         return
 
     def action(target: Any = None, source: Any = None, env: Any = env) -> int:
@@ -4089,13 +4107,9 @@ def register_pio_targets(env: Any) -> None:
     if _already_loaded(env):
         return
     project_dir = Path(env.subst("$PROJECT_DIR"))
-
-    # Collect environments from the PIO config
-    try:
-        config = env.GetProjectConfig()
-        envs = config.envs()
-    except Exception:
-        envs = [env.subst("$PIOENV")]
+    # The lock-* targets act on the env being built: `pio run -e a -t lock-capture` must not
+    # touch other envs, and `pio run -t lock-capture` runs this once per env anyway.
+    envs = [env.subst("$PIOENV")]
 
     def _make_action(fn: Callable[..., int]) -> Callable[..., None]:
         def action(*_args: Any, **_kwargs: Any) -> None:

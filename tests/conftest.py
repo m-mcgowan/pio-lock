@@ -3,12 +3,39 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from pio_lock import PlatformLock
+
+
+@pytest.fixture(scope="session")
+def native_platform() -> None:
+    """Install the ``native`` platform once per session (a fresh PLATFORMIO_CORE_DIR has none).
+
+    Integration tests that read or capture ``native`` without installing it first rely on it.
+    """
+    from tests.pio_project import have_pio
+
+    if not have_pio():
+        return
+    result = subprocess.run(
+        ["pio", "pkg", "install", "-g", "-p", "platformio/native"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stdout
+
+
+@pytest.fixture(autouse=True)
+def _integration_has_native(request: pytest.FixtureRequest) -> None:
+    if request.node.get_closest_marker("integration") is not None:
+        request.getfixturevalue("native_platform")
 
 
 @pytest.fixture
