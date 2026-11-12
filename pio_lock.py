@@ -2322,13 +2322,103 @@ except NameError:
     pass
 
 
+# ── init ─────────────────────────────────────────────────────────────────────
+
+_SECTION_RE = re.compile(r"^\s*\[([^\]]*)\]")
+_EXTRA_CONFIGS_RE = re.compile(r"^extra_configs\s*[=:](.*)$", re.IGNORECASE)
+
+
+def _is_comment(line: str) -> bool:
+    return line.lstrip().startswith((";", "#"))
+
+
+def _lock_ini_listed(entries: list[str]) -> bool:
+    for entry in entries:
+        for item in entry.split(","):
+            if item.strip() in (LOCK_INI_NAME, f"./{LOCK_INI_NAME}"):
+                return True
+    return False
+
+
+def init(project_dir: Path, dry_run: bool = False) -> int:
+    """Add ``pio.lock.ini`` to ``[platformio] extra_configs`` in platformio.ini.
+
+    A plain text edit (no configparser round trip) so comments and layout survive.
+    """
+    ini_path = Path(project_dir) / "platformio.ini"
+    if not ini_path.is_file():
+        print(f"Error: {ini_path} not found", file=sys.stderr)
+        return 1
+    with open(ini_path, newline="") as f:
+        original = f.read()
+    nl = "\r\n" if "\r\n" in original else "\n"
+    lines = original.splitlines(keepends=True)
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] += nl
+
+    section_start = None
+    section_end = len(lines)
+    for i, line in enumerate(lines):
+        m = _SECTION_RE.match(line)
+        if not m or line[0] in " \t":
+            continue
+        if section_start is None:
+            if m.group(1).strip() == "platformio":
+                section_start = i
+        elif section_end == len(lines):
+            section_end = i
+            break
+
+    if section_start is None:
+        new_line = f"extra_configs = {LOCK_INI_NAME}{nl}"
+        lines[0:0] = [f"[platformio]{nl}", new_line, nl]
+        changed = new_line
+    else:
+        opt_idx = None
+        for i in range(section_start + 1, section_end):
+            if lines[i][:1] not in (" ", "\t") and _EXTRA_CONFIGS_RE.match(
+                lines[i].rstrip("\r\n")
+            ):
+                opt_idx = i
+                break
+        if opt_idx is None:
+            new_line = f"extra_configs = {LOCK_INI_NAME}{nl}"
+            lines.insert(section_start + 1, new_line)
+            changed = new_line
+        else:
+            first = _EXTRA_CONFIGS_RE.match(lines[opt_idx].rstrip("\r\n"))
+            assert first is not None
+            entries = [first.group(1)]
+            last_entry_idx = opt_idx
+            indent = "    "
+            j = opt_idx + 1
+            while j < section_end and (lines[j][:1] in (" ", "\t") or not lines[j].strip()):
+                text = lines[j].strip()
+                if text and not _is_comment(lines[j]):
+                    entries.append(text)
+                    last_entry_idx = j
+                    indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
+                j += 1
+            if _lock_ini_listed(entries):
+                print(f"{LOCK_INI_NAME} already included in {ini_path}")
+                return 0
+            new_line = f"{indent}{LOCK_INI_NAME}{nl}"
+            lines.insert(last_entry_idx + 1, new_line)
+            changed = new_line
+
+    verb = "Would add" if dry_run else "Added"
+    print(f"{verb} {LOCK_INI_NAME} to extra_configs in {ini_path}:")
+    print(f"  {changed.rstrip()}")
+    if not dry_run:
+        with open(ini_path, "w", newline="") as f:
+            f.write("".join(lines))
+    return 0
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    if argv is None:
-        # A real CLI run (sys.argv). In-process callers pass argv and are never replaced.
-        _ensure_pio_python(sys.argv[1:])
     parser = argparse.ArgumentParser(
         prog="pio-lock",
         description="PlatformIO dependency lockfile tool for reproducible builds",
@@ -2433,6 +2523,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Update only a specific library (name substring match)",
     )
 
+    p_init = sub.add_parser(
+        "init",
+        help=f"Add {LOCK_INI_NAME} to [platformio] extra_configs in platformio.ini",
+    )
+    p_init.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the change without modifying platformio.ini",
+    )
+
     # Snapshot subcommands (no -e required — they operate on the project)
     snapshot_cmds = {
         "snapshot-capture": "Generate build_snapshot.json from current HEAD",
@@ -2444,7 +2544,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         sub.add_parser(name, help=help_text)
 
     args = parser.parse_args(argv)
+    if argv is None and args.command != "init":
+        # A real CLI run (sys.argv). In-process callers pass argv and are never replaced.
+        # init is a pure text edit and works from any Python.
+        _ensure_pio_python(sys.argv[1:])
     project_dir = Path(args.project_dir).resolve()
+
+    if args.command == "init":
+        return init(project_dir, dry_run=args.dry_run)
 
     if args.command == "capture":
         output = Path(args.output) if args.output else None
