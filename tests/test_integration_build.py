@@ -480,3 +480,38 @@ def test_capture_platform_inherited_from_env_section_real_pio(tmp_path: Path) ->
     envs = _lockfile(p)["envs"]
     assert envs["a"]["platform"]["spec"] == "native"
     assert envs["b"]["platform"]["spec"] == "native"
+
+
+@requires_pio
+def test_check_warn_only_on_real_project(tmp_path: Path) -> None:
+    p = make_native_project(tmp_path, "[env:native]\nplatform = native\n")
+    cli = [sys.executable, str(REPO_ROOT / "pio_lock.py"), "-d", str(p)]
+
+    def run(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [*cli, *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env={**os.environ, **(env or {})},
+            timeout=600,
+        )
+
+    captured = run("capture", "-e", "native")
+    assert captured.returncode == 0, captured.stdout
+    ok = run("check", "-e", "native")
+    assert ok.returncode == 0, ok.stdout
+
+    (p / "platformio.ini").write_text("[env:native]\nplatform = native@*\n")
+    failed = run("check", "-e", "native")
+    assert failed.returncode == 1, failed.stdout
+    assert "DRIFT:" in failed.stdout
+
+    warned = run("check", "-e", "native", "--warn-only")
+    assert warned.returncode == 0, warned.stdout
+    assert "WARNING:" in warned.stdout
+    assert "DRIFT:" not in warned.stdout
+
+    env_warned = run("check", "-e", "native", env={"PIO_LOCK_DRIFT": "warn"})
+    assert env_warned.returncode == 0, env_warned.stdout
+    assert "WARNING:" in env_warned.stdout

@@ -754,3 +754,238 @@ def test_capture_upgrades_v1_lockfile(tmp_project: Path, fake_pio: Any) -> None:
         "libraries": [{"name": "Old", "type": "registry", "version": "1.0.0", "owner": "o"}]
     }
     assert "platform" in data["envs"]["testenv"]
+
+
+# ── check / restore of the platform ─────────────────────────────────────────
+
+
+def _locked_project(project: Path, fake_pio: Any, lock: PlatformLock) -> None:
+    """Capture ``lock`` for ``testenv`` (so the lockfile is v2), then reinstall the fake."""
+    fake_pio({"testenv": lock})
+    assert pio_lock.capture(project, ["testenv"]) == 0
+
+
+def test_check_passes_for_matching_platform(tmp_project: Path, fake_pio: Any, capsys: Any) -> None:
+    _locked_project(tmp_project, fake_pio, _lock())
+    assert pio_lock.check(tmp_project, ["testenv"]) == 0
+    assert "DRIFT" not in capsys.readouterr().out
+
+
+def test_check_reports_platform_version_drift(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    _locked_project(tmp_project, fake_pio, _lock(version="6.6.0"))
+    fake_pio({"testenv": _lock(version="6.6.0")}, in_use={"testenv": ("espressif32", "6.7.0")})
+    assert pio_lock.check(tmp_project, ["testenv"]) == 1
+    out = capsys.readouterr().out
+    assert "DRIFT:" in out
+    assert "locked 6.6.0, in use 6.7.0" in out
+
+
+def test_check_reports_stale_platform_spec(tmp_project: Path, fake_pio: Any, capsys: Any) -> None:
+    _locked_project(tmp_project, fake_pio, _lock())
+    (tmp_project / "platformio.ini").write_text("[env:testenv]\nplatform = espressif32@^7\n")
+    assert pio_lock.check(tmp_project, ["testenv"]) == 1
+    out = capsys.readouterr().out
+    assert "platform spec changed: 'espressif32' → 'espressif32@^7'; run capture" in out
+
+
+def test_check_reports_stale_platform_packages(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    _locked_project(tmp_project, fake_pio, _lock())
+    (tmp_project / "platformio.ini").write_text(
+        "[env:testenv]\nplatform = espressif32\nplatform_packages =\n  tool-foo@1.2.3\n"
+    )
+    assert pio_lock.check(tmp_project, ["testenv"]) == 1
+    out = capsys.readouterr().out
+    assert "DRIFT:" in out
+    assert "platform_packages changed" in out
+    assert "tool-foo@1.2.3" in out
+    assert "run capture" in out
+
+
+def test_check_reports_package_drift(tmp_project: Path, fake_pio: Any, capsys: Any) -> None:
+    locked = _lock(
+        packages=[
+            PackageLock("toolchain-xtensa", "8.4.0", owner="espressif"),
+            PackageLock("tool-local", "1.0.0", src_url="file:///opt/tool-local"),
+            PackageLock("tool-gone", "2.0.0", owner="espressif"),
+        ]
+    )
+    _locked_project(tmp_project, fake_pio, locked)
+    installed = _lock(
+        packages=[
+            PackageLock("toolchain-xtensa", "8.5.0", owner="espressif"),
+            PackageLock("tool-local", "0.9.0", src_url="file:///opt/tool-local"),
+        ]
+    )
+    fake_pio({"testenv": installed})
+    assert pio_lock.check(tmp_project, ["testenv"]) == 1
+    out = capsys.readouterr().out
+    assert "package toolchain-xtensa: locked 8.4.0, installed 8.5.0" in out
+    assert "package tool-local: locked 1.0.0, installed 0.9.0" in out
+    assert "package tool-gone: locked 2.0.0, not installed" in out
+
+
+def test_check_platform_not_installed_is_drift(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    _locked_project(tmp_project, fake_pio, _lock())
+    fake_pio({})
+    assert pio_lock.check(tmp_project, ["testenv"]) == 1
+    assert "DRIFT:" in capsys.readouterr().out
+
+
+def test_check_incompatible_pio_warns_and_checks_libraries(
+    tmp_project: Path, fake_pio: Any, make_registry_lib: Any, capsys: Any
+) -> None:
+    make_registry_lib("testenv", "MyLib", "1.0.0", project_dir=tmp_project)
+    _locked_project(tmp_project, fake_pio, _lock())
+    fake_pio({"testenv": _lock()}, incompatible="platformio.x.y")
+    assert pio_lock.check(tmp_project, ["testenv"]) == 0
+    captured = capsys.readouterr()
+    assert "WARNING:" in captured.out
+    assert "DRIFT" not in captured.out
+
+
+def test_check_incompatible_pio_still_fails_on_library_drift(
+    tmp_project: Path, fake_pio: Any, make_registry_lib: Any
+) -> None:
+    make_registry_lib("testenv", "MyLib", "1.0.0", project_dir=tmp_project)
+    _locked_project(tmp_project, fake_pio, _lock())
+    make_registry_lib("testenv", "MyLib", "1.1.0", project_dir=tmp_project)
+    fake_pio({"testenv": _lock()}, incompatible="platformio.x.y")
+    assert pio_lock.check(tmp_project, ["testenv"]) == 1
+
+
+def test_check_v1_lockfile_skips_platform(tmp_project: Path, capsys: Any, make_registry_lib: Any):
+    make_registry_lib("testenv", "MyLib", "1.0.0", project_dir=tmp_project)
+    write_lockfile(
+        tmp_project,
+        {"testenv": [{"name": "MyLib", "type": "registry", "version": "1.0.0", "owner": "o"}]},
+    )
+    assert pio_lock.check(tmp_project, ["testenv"]) == 0
+    assert (
+        "platform not checked: lockfile is v1; run capture to lock the platform"
+        in capsys.readouterr().out
+    )
+
+
+def _drifted(tmp_project: Path, fake_pio: Any, make_registry_lib: Any) -> None:
+    """Platform drift (6.6.0 locked, 6.7.0 in use) and library drift."""
+    make_registry_lib("testenv", "MyLib", "1.0.0", project_dir=tmp_project)
+    _locked_project(tmp_project, fake_pio, _lock())
+    make_registry_lib("testenv", "MyLib", "1.1.0", project_dir=tmp_project)
+    fake_pio({"testenv": _lock()}, in_use={"testenv": ("espressif32", "6.7.0")})
+
+
+def test_check_warn_only_exits_zero_with_warnings(
+    tmp_project: Path, fake_pio: Any, make_registry_lib: Any, capsys: Any
+) -> None:
+    _drifted(tmp_project, fake_pio, make_registry_lib)
+    assert pio_lock.check(tmp_project, ["testenv"], warn_only=True) == 0
+    out = capsys.readouterr().out
+    assert "WARNING:" in out
+    assert "locked 6.6.0, in use 6.7.0" in out
+    assert "DRIFT:" not in out
+
+
+def test_check_drift_env_var_warn_equals_flag(
+    tmp_project: Path,
+    fake_pio: Any,
+    make_registry_lib: Any,
+    capsys: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _drifted(tmp_project, fake_pio, make_registry_lib)
+    monkeypatch.setenv("PIO_LOCK_DRIFT", "warn")
+    assert pio_lock.check(tmp_project, ["testenv"]) == 0
+    out = capsys.readouterr().out
+    assert "WARNING:" in out
+    assert "DRIFT:" not in out
+
+
+def test_check_drift_env_var_fail_does_not_override_flag(
+    tmp_project: Path,
+    fake_pio: Any,
+    make_registry_lib: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _drifted(tmp_project, fake_pio, make_registry_lib)
+    monkeypatch.setenv("PIO_LOCK_DRIFT", "fail")
+    assert pio_lock.check(tmp_project, ["testenv"], warn_only=True) == 0
+    assert pio_lock.check(tmp_project, ["testenv"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("warn", "warn"), (" FAIL ", "fail"), ("bogus", None), ("", None), (None, None)],
+)
+def test_drift_policy_from_env(monkeypatch: pytest.MonkeyPatch, value: Any, expected: Any) -> None:
+    if value is None:
+        monkeypatch.delenv("PIO_LOCK_DRIFT", raising=False)
+    else:
+        monkeypatch.setenv("PIO_LOCK_DRIFT", value)
+    assert pio_lock._drift_policy_from_env() == expected
+
+
+def test_cli_check_warn_only_flag(
+    tmp_project: Path, fake_pio: Any, make_registry_lib: Any
+) -> None:
+    _drifted(tmp_project, fake_pio, make_registry_lib)
+    argv = ["-d", str(tmp_project), "check", "-e", "testenv"]
+    assert pio_lock.main(argv) == 1
+    assert pio_lock.main([*argv, "--warn-only"]) == 0
+
+
+def _install_calls(log: list[list[str]]) -> list[list[str]]:
+    return [c for c in log if c[:3] == ["pio", "pkg", "install"]]
+
+
+def test_restore_installs_platform_before_libraries(
+    tmp_project: Path, fake_pio: Any, mock_git_commands: Any, capsys: Any
+) -> None:
+    locked = _lock(
+        packages=[
+            PackageLock("toolchain-xtensa", "8.4.0", owner="espressif"),
+            PackageLock("tool-local", "1.0.0", src_url="file:///opt/tool-local"),
+        ]
+    )
+    fake_pio({"testenv": locked})
+    (tmp_project / ".pio" / "libdeps" / "testenv").mkdir(parents=True)
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    data = _read_lock(tmp_project)
+    data["envs"]["testenv"]["libraries"] = [
+        {"name": "NewLib", "type": "registry", "version": "3.0.0", "owner": "acme"}
+    ]
+    (tmp_project / "pio.lock.json").write_text(json.dumps(data))
+    mock_git_commands.clear()
+
+    assert pio_lock.restore(tmp_project, ["testenv"]) == 0
+    calls = _install_calls(mock_git_commands)
+    assert len(calls) == 3
+    first = calls[0]
+    assert first[first.index("--platform") + 1] == "platformio/espressif32@6.6.0"
+    assert "--no-save" in first
+    assert first[first.index("-e") + 1] == "testenv"
+    second = calls[1]
+    assert second[second.index("--tool") + 1] == "espressif/toolchain-xtensa@8.4.0"
+    assert "--no-save" in second
+    assert "--library" in calls[2]
+    assert "managed by the platform" in capsys.readouterr().out
+    assert not any("tool-local" in " ".join(c) for c in calls)
+
+
+def test_restore_v1_lockfile_installs_libraries_only(
+    tmp_project: Path, mock_git_commands: Any
+) -> None:
+    (tmp_project / ".pio" / "libdeps" / "testenv").mkdir(parents=True)
+    write_lockfile(
+        tmp_project,
+        {"testenv": [{"name": "NewLib", "type": "registry", "version": "3.0.0", "owner": "a"}]},
+    )
+    assert pio_lock.restore(tmp_project, ["testenv"]) == 0
+    calls = _install_calls(mock_git_commands)
+    assert len(calls) == 1
+    assert "--platform" not in calls[0]
