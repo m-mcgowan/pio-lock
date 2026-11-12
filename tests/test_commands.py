@@ -602,3 +602,4 @@ class TestCaptureGitRefs:
             url="https://github.com/o/x.git",
         )
         assert lib["ref"] == "v2.0"
+        assert lib["ref_type"] == "tag"

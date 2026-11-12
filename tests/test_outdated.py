@@ -1277,3 +1277,86 @@ class TestCheckRegistryPlatform:
         rc = pio_lock.outdated(tmp_path, ["test"])
         assert rc == 1
         assert "6.9.0" in capsys.readouterr().out
+
+
+class TestOutdatedUsesLockedSha:
+    """The branch check compares the branch head with the LOCKED commit."""
+
+    URL = "https://github.com/o/r.git"
+
+    def _setup(self, tmp_path, monkeypatch, lock_libs, head=HEAD):
+        (tmp_path / "platformio.ini").write_text("[env:test]\nplatform = native\n")
+        lock = {
+            "lockfile_version": 2,
+            "envs": {"test": {"libraries": lock_libs}},
+        }
+        (tmp_path / "pio.lock.json").write_text(json.dumps(lock))
+        github = FakeGitHubClient({"repos/o/r/branches/dev": {"commit": {"sha": head}}})
+        monkeypatch.setattr(pio_lock, "_create_github_client_fn", lambda: github)
+
+    def _lock_lib(self, sha, ref="dev"):
+        return {
+            "name": "r",
+            "type": "git",
+            "url": self.URL,
+            "sha": sha,
+            "ref": ref,
+            "ref_type": "branch",
+        }
+
+    def _outdated_json(self, tmp_path, capsys):
+        rc = pio_lock.outdated(tmp_path, ["test"], output_json=True)
+        return rc, json.loads(capsys.readouterr().out)["git_deps"]
+
+    def test_installed_at_head_but_lock_old_is_outdated(
+        self, tmp_path, mock_pio, monkeypatch, capsys
+    ):
+        mock_pio.add_lib("test", f"{self.URL}#dev", "r", f"1.0.0+sha.{HEAD}", external=True)
+        self._setup(tmp_path, monkeypatch, [self._lock_lib(LOCKED)])
+        rc, git = self._outdated_json(tmp_path, capsys)
+        assert rc == 1
+        assert git[0]["current"] == LOCKED[:7]
+        assert git[0]["latest"] == HEAD[:7]
+
+    def test_locked_but_not_installed_is_still_checked(
+        self, tmp_path, mock_pio, monkeypatch, capsys
+    ):
+        self._setup(tmp_path, monkeypatch, [self._lock_lib(LOCKED)])
+        rc, git = self._outdated_json(tmp_path, capsys)
+        assert rc == 1
+        assert git[0]["name"] == "r"
+        assert git[0]["current"] == LOCKED[:7]
+
+    def test_lock_ref_used_when_spec_has_none(self, tmp_path, mock_pio, monkeypatch, capsys):
+        mock_pio.add_lib("test", self.URL, "r", f"1.0.0+sha.{HEAD}", external=True)
+        self._setup(tmp_path, monkeypatch, [self._lock_lib(LOCKED)])
+        _rc, git = self._outdated_json(tmp_path, capsys)
+        assert git[0]["ref"] == "dev"
+        assert git[0]["current"] == LOCKED[:7]
+
+    def test_no_lock_entry_falls_back_to_installed_version(
+        self, tmp_path, mock_pio, monkeypatch, capsys
+    ):
+        mock_pio.add_lib("test", f"{self.URL}#dev", "r", f"1.0.0+sha.{LOCKED}", external=True)
+        self._setup(tmp_path, monkeypatch, [])
+        rc, git = self._outdated_json(tmp_path, capsys)
+        assert rc == 1
+        assert git[0]["current"] == LOCKED[:7]
+        assert git[0]["latest"] == HEAD[:7]
+
+    def test_registry_lookups_are_cached_per_run(self, tmp_path, monkeypatch):
+        from tests.fakes import FakePioAdapter
+
+        adapter = FakePioAdapter(platforms={}, latest_versions={"espressif32": "6.9.0"})
+        calls = []
+        orig = adapter.latest_platform_version
+        adapter.latest_platform_version = lambda n, o=None: (calls.append(n), orig(n, o))[1]
+        monkeypatch.setattr(pio_lock, "_pio_adapter_factory", lambda: adapter)
+        (tmp_path / "pio.lock.json").write_text(
+            json.dumps(
+                {"lockfile_version": 2, "envs": {"a": _env_lock("6.6.0"), "b": _env_lock("6.6.0")}}
+            )
+        )
+        results = pio_lock._registry_platform_results(tmp_path, ["a", "b"])
+        assert len(results) == 2
+        assert calls == ["espressif32"]

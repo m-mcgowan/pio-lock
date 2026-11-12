@@ -1677,7 +1677,7 @@ def _check_git_dep(
     elif ref_type == "tag":
         assert ref is not None
         return _check_tag_dep(owner, repo, ref, name, github)
-    locked_sha = _locked_sha(current_version)
+    locked_sha = _sha_from_version(current_version)
     if locked_sha is None:
         return None
     if ref_type == "branch":
@@ -1691,7 +1691,7 @@ def _check_git_dep(
     return _check_branch_dep(owner, repo, str(default_branch), locked_sha, name, github)
 
 
-def _locked_sha(version: str) -> Optional[str]:
+def _sha_from_version(version: str) -> Optional[str]:
     """The resolved commit in a PlatformIO git package version (``+sha.<rev>`` or a bare sha)."""
     match = _GIT_SHA_SUFFIX_RE.search(version)
     if match:
@@ -1988,7 +1988,10 @@ def _check_platform(
 
 
 def _check_registry_platform(
-    project_dir: Path, env: str, env_lock: dict[str, Any]
+    project_dir: Path,
+    env: str,
+    env_lock: dict[str, Any],
+    cache: Optional[dict[tuple[str, Optional[str]], Optional[str]]] = None,
 ) -> Optional[dict[str, Any]]:
     """Compare a registry platform's locked version with the newest registry version.
 
@@ -1999,7 +2002,13 @@ def _check_registry_platform(
     if not platform or platform.get("src_url"):
         return None
     name, current = str(platform["name"]), str(platform["version"])
-    latest = _pio_adapter_factory().latest_platform_version(name, platform.get("owner"))
+    key = (name, platform.get("owner"))
+    if cache is not None and key in cache:
+        latest = cache[key]
+    else:
+        latest = _pio_adapter_factory().latest_platform_version(*key)
+        if cache is not None:
+            cache[key] = latest
     if not latest:
         return None
     base = {"env": env, "name": name, "current": current}
@@ -2079,18 +2088,77 @@ def _registry_platform_results(project_dir: Path, envs: list[str]) -> list[dict[
         return []
     locked_envs = load_lockfile(lockfile_path).get("envs", {})
     results: list[dict[str, Any]] = []
+    cache: dict[tuple[str, Optional[str]], Optional[str]] = {}
     for env_name in envs:
         env_lock = locked_envs.get(env_name)
         if not env_lock:
             continue
         try:
-            result = _check_registry_platform(project_dir, env_name, env_lock)
+            result = _check_registry_platform(project_dir, env_name, env_lock, cache)
         except PioIncompatible as exc:
             print(f"  Warning: registry platform check skipped: {exc}", file=sys.stderr)
             return results
         if result:
             results.append(result)
     return results
+
+
+def _git_check_entries(
+    project_dir: Path, envs: list[str], entries: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Git deps to check, with the LOCKED commit (and recorded ref) overlaid on installed ones.
+
+    Installed git entries take the lock's sha when the lock has the library (matched by
+    normalised URL, else name) and the lock's ref when the spec names none. Locked git
+    libraries that are not installed are added. Without a lock entry the installed
+    version's ``+sha`` is used.
+    """
+    lockfile_path = project_dir / LOCKFILE_NAME
+    locked_envs = load_lockfile(lockfile_path).get("envs", {}) if lockfile_path.exists() else {}
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in entries:
+        if entry["type"] != "git":
+            continue
+        entry = dict(entry)
+        match = _LIB_DEP_URL_RE.search(entry["spec_str"])
+        spec_url = _normalize_git_url(match.group(1)) if match else None
+        locked = None
+        for lib in locked_envs.get(entry["env"], {}).get("libraries", []):
+            if lib.get("type") != "git" or not lib.get("sha"):
+                continue
+            if (spec_url and _normalize_git_url(str(lib.get("url") or "")) == spec_url) or (
+                lib.get("name") == entry["name"]
+            ):
+                locked = lib
+                break
+        if locked:
+            entry["current"] = str(locked["sha"])
+            if match and not match.group(2) and locked.get("ref"):
+                entry["spec_str"] = f"{entry['spec_str'].rstrip()}#{locked['ref']}"
+        seen.add((entry["env"], entry["name"]))
+        result.append(entry)
+    for env_name in envs:
+        for lib in locked_envs.get(env_name, {}).get("libraries", []):
+            if lib.get("type") != "git" or not lib.get("sha") or not lib.get("url"):
+                continue
+            if (env_name, lib["name"]) in seen:
+                continue
+            ref = lib.get("ref")
+            result.append(
+                {
+                    "env": env_name,
+                    "name": lib["name"],
+                    "current": str(lib["sha"]),
+                    "wanted": None,
+                    "latest": None,
+                    "type": "git",
+                    "spec_str": f"{lib['url']}#{ref}" if ref else str(lib["url"]),
+                    "is_outdated": False,
+                    "detached": False,
+                }
+            )
+    return result
 
 
 def outdated(
@@ -2105,6 +2173,8 @@ def outdated(
 
     entries = _get_outdated_entries(project_dir, envs)
 
+    git_entries = _git_check_entries(project_dir, envs, entries)
+
     # GitHub-aware checks for git deps and platform
     github = _create_github_client_fn()
     git_results: list[dict[str, Any]] = []
@@ -2112,7 +2182,7 @@ def outdated(
     github_skipped_reason: Optional[str] = None
 
     if github:
-        git_results = _check_git_deps(entries, github)
+        git_results = _check_git_deps(git_entries, github)
         platform_result = _check_platform(project_dir, envs[0], github)
     else:
         github_skipped_reason = (
@@ -2172,7 +2242,7 @@ def outdated(
             print(f"{marker}{entry['name']:<38} {current:<12} {wanted:<12} {latest:<12}")
 
     # Git dependencies section
-    git_entries_from_pio = [e for e in entries if e["type"] == "git"]
+    git_entries_from_pio = git_entries
     if git_entries_from_pio:
         print(f"\n{'Git dependencies'}")
         print("-" * 76)
@@ -2210,7 +2280,7 @@ def outdated(
         print(f"{marker}{platform_result['name']:<38} {platform_result['message']}")
 
     if registry_platform_results:
-        print(f"\n{'Registry platforms'}")
+        print("\nRegistry platforms")
         print("-" * 76)
         for reg in registry_platform_results:
             marker = " *" if reg["status"] == "outdated" else "  "
