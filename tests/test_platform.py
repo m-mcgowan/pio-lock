@@ -6,6 +6,9 @@ overridden ``_import``; everything else uses ``tests.fakes.FakePioAdapter``.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -198,3 +201,137 @@ def test_fake_adapter_config_views(tmp_path: Path) -> None:
 
 def test_adapter_factory_seam_defaults_to_real_adapter() -> None:
     assert pio_lock._pio_adapter_factory is PioAdapter
+
+
+# ── Re-exec under PlatformIO's Python ────────────────────────────────────────
+
+
+@pytest.fixture
+def reexec(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Stub the importability check, PIO Python lookup and os.execve."""
+    state: dict[str, Any] = {"importable": False, "python": "/pio/penv/bin/python", "exec": None}
+    monkeypatch.delenv(pio_lock._REEXEC_ENV, raising=False)
+    monkeypatch.setattr(pio_lock, "_platformio_importable", lambda: state["importable"])
+    monkeypatch.setattr(pio_lock, "_find_pio_python", lambda: state["python"])
+
+    def fake_execve(path: str, args: list[str], env: dict[str, str]) -> None:
+        state["exec"] = (path, args, env)
+
+    monkeypatch.setattr(os, "execve", fake_execve)
+    return state
+
+
+def test_reexec_under_pio_python_when_platformio_missing(reexec: dict[str, Any]) -> None:
+    pio_lock._ensure_pio_python(["-d", "proj", "capture", "-e", "native"])
+    path, args, env = reexec["exec"]
+    assert path == "/pio/penv/bin/python"
+    assert args == [
+        "/pio/penv/bin/python",
+        os.path.abspath(pio_lock.__file__),
+        "-d",
+        "proj",
+        "capture",
+        "-e",
+        "native",
+    ]
+    assert env["PIO_LOCK_REEXEC"] == "1"
+    assert env["PATH"] == os.environ["PATH"]
+
+
+def test_no_reexec_when_platformio_importable(reexec: dict[str, Any], capsys) -> None:
+    reexec["importable"] = True
+    pio_lock._ensure_pio_python(["capture", "-e", "native"])
+    assert reexec["exec"] is None
+    assert capsys.readouterr().err == ""
+
+
+def test_no_reexec_when_already_reexeced(
+    reexec: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    monkeypatch.setenv("PIO_LOCK_REEXEC", "1")
+    pio_lock._ensure_pio_python(["capture", "-e", "native"])
+    assert reexec["exec"] is None
+    assert "platform locking disabled" in capsys.readouterr().err
+
+
+def test_warns_and_continues_when_pio_python_not_found(reexec: dict[str, Any], capsys) -> None:
+    reexec["python"] = None
+    pio_lock._ensure_pio_python(["capture", "-e", "native"])
+    assert reexec["exec"] is None
+    assert capsys.readouterr().err.strip() == (
+        "pio-lock: PlatformIO's Python not found; platform locking disabled "
+        "(install pio-lock into PlatformIO's Python: ~/.platformio/penv/bin/pip install pio-lock)"
+    )
+
+
+def test_find_pio_python_parses_system_info(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+    info = {
+        "core_version": {"title": "PlatformIO Core", "value": "6.1.18"},
+        "python_exe": {"title": "Python Executable", "value": "/pio/penv/bin/python"},
+    }
+
+    def fake_run(args: list[str], cwd: Any = None, check: bool = True) -> str:
+        calls.append(args)
+        return json.dumps(info)
+
+    monkeypatch.setattr(pio_lock, "_run_cmd", fake_run)
+    assert pio_lock._find_pio_python() == "/pio/penv/bin/python"
+    assert calls == [["pio", "system", "info", "--json-output"]]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        FileNotFoundError("pio"),
+        subprocess.CalledProcessError(1, ["pio"]),
+        "not json",
+        json.dumps({"core_version": {"value": "6.1.18"}}),
+        json.dumps({"python_exe": {"value": ""}}),
+    ],
+)
+def test_find_pio_python_none_when_unavailable(
+    monkeypatch: pytest.MonkeyPatch, outcome: Any
+) -> None:
+    def fake_run(args: list[str], cwd: Any = None, check: bool = True) -> str:
+        if isinstance(outcome, Exception):
+            raise outcome
+        return str(outcome)
+
+    monkeypatch.setattr(pio_lock, "_run_cmd", fake_run)
+    assert pio_lock._find_pio_python() is None
+
+
+def test_main_with_explicit_argv_never_reexecs(
+    reexec: dict[str, Any], tmp_path: Path, capsys
+) -> None:
+    """In-process callers pass argv; only a real CLI run may replace the process."""
+    pio_lock.main(["-d", str(tmp_path), "snapshot-print"])
+    assert reexec["exec"] is None
+
+
+def test_main_without_argv_reexecs_with_sys_argv(
+    reexec: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sys.argv", ["pio-lock", "-d", "x", "snapshot-print"])
+
+    def stop(path: str, args: list[str], env: dict[str, str]) -> None:
+        raise SystemExit(args[2:])
+
+    monkeypatch.setattr(os, "execve", stop)
+    with pytest.raises(SystemExit) as exc_info:
+        pio_lock.main()
+    assert exc_info.value.code == ["-d", "x", "snapshot-print"]
+
+
+def test_capture_helpers_tolerate_missing_pio_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_project: Path
+) -> None:
+    """Without the pio CLI (warn-and-continue path) capture's pio lookups degrade to 'unknown'."""
+
+    def no_pio(args: list[str], cwd: Any = None, check: bool = True) -> str:
+        raise FileNotFoundError(2, "No such file or directory", "pio")
+
+    monkeypatch.setattr(pio_lock, "_run_cmd", no_pio)
+    assert pio_lock.get_pio_core_version() == "unknown"
+    assert pio_lock.get_platform_url(tmp_project, "testenv") == "unknown"

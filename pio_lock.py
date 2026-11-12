@@ -381,7 +381,10 @@ def snapshot_print(project_dir: Path) -> int:
 
 
 def get_pio_core_version() -> str:
-    output = run_cmd(["pio", "system", "info"])
+    try:
+        output = run_cmd(["pio", "system", "info"])
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
     for line in output.splitlines():
         if "PlatformIO Core" in line:
             parts = line.split()
@@ -403,7 +406,7 @@ def get_platform_url(project_dir: Path, env_name: str) -> str:
                 for key, val in section[1]:
                     if key == "platform":
                         return str(val)
-    except (subprocess.CalledProcessError, json.JSONDecodeError, IndexError):
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, IndexError):
         pass
     return "unknown"
 
@@ -1015,6 +1018,60 @@ class PioAdapter:
 
 # Mockable seam — tests replace this with a factory returning a fake adapter.
 _pio_adapter_factory: Callable[[], PioAdapter] = PioAdapter
+
+
+# ── Running under PlatformIO's Python ────────────────────────────────────────
+#
+# Platform locking needs ``platformio`` importable. When the CLI is installed into some other
+# Python (pipx, a project venv), re-run it under PlatformIO's own interpreter.
+
+_REEXEC_ENV = "PIO_LOCK_REEXEC"
+
+_PIO_PYTHON_NOT_FOUND = (
+    "pio-lock: PlatformIO's Python not found; platform locking disabled "
+    "(install pio-lock into PlatformIO's Python: ~/.platformio/penv/bin/pip install pio-lock)"
+)
+
+
+def _platformio_importable() -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("platformio") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _find_pio_python() -> Optional[str]:
+    """PlatformIO's interpreter, from ``pio system info``; None if pio is missing or unparsable."""
+    try:
+        output = run_cmd(["pio", "system", "info", "--json-output"])
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    try:
+        value = json.loads(output)["python_exe"]["value"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return value if isinstance(value, str) and value else None
+
+
+def _ensure_pio_python(argv: list[str]) -> None:
+    """Re-exec this script under PlatformIO's Python unless ``platformio`` already imports.
+
+    ``PIO_LOCK_REEXEC`` marks the re-exec'd process so it never execs again. If PlatformIO's
+    Python can't be found (or is the one we're already in), warn and carry on: libraries are
+    still locked, platform locking is skipped.
+    """
+    if _platformio_importable():
+        return
+    python = None if os.environ.get(_REEXEC_ENV) else _find_pio_python()
+    if python:
+        env = {**os.environ, _REEXEC_ENV: "1"}
+        sys.stdout.flush()
+        sys.stderr.flush()
+        with contextlib.suppress(OSError):  # unusable interpreter: fall through to the warning
+            os.execve(python, [python, os.path.abspath(__file__), *argv], env)
+    print(_PIO_PYTHON_NOT_FOUND, file=sys.stderr)
 
 
 # ── GitHub-aware update detection ──────────────────────────────────────────
@@ -1948,6 +2005,9 @@ except NameError:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    if argv is None:
+        # A real CLI run (sys.argv). In-process callers pass argv and are never replaced.
+        _ensure_pio_python(sys.argv[1:])
     parser = argparse.ArgumentParser(
         prog="pio-lock",
         description="PlatformIO dependency lockfile tool for reproducible builds",

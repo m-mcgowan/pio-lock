@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from tests.pio_project import (
+    REPO_ROOT,
     make_native_project,
     piolock_lib,
     requires_pio,
@@ -267,3 +272,117 @@ def test_resolve_platform_package_not_installed(tmp_path: Path) -> None:
     (p / "platformio.ini").write_text(ini)
     out = run_in_pio_python(_RESOLVE_CODE, str(p), "native", cwd=tmp_path)
     assert "pio pkg install -e native" in out["resolve_platform"]["not_installed"]
+
+
+# ── Running the CLI from a Python without PlatformIO ─────────────────────────
+
+_NOT_FOUND = "PlatformIO's Python not found"
+
+
+@pytest.fixture(scope="module")
+def bare_venv(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A fresh venv without platformio, with pio-lock pip-installed from this checkout.
+
+    The package is built from a copy of the checkout so the build doesn't write
+    ``build/`` or ``*.egg-info`` into the repo.
+    """
+    root = tmp_path_factory.mktemp("bare")
+    src = root / "src"
+    src.mkdir()
+    for name in ("pio_lock.py", "pyproject.toml", "README.md", "LICENSE"):
+        shutil.copy2(REPO_ROOT / name, src / name)
+    venv = root / "venv"
+    subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True, capture_output=True)
+    subprocess.run(
+        [str(venv / "bin/pip"), "install", "-q", str(src)],
+        check=True,
+        capture_output=True,
+        timeout=600,
+    )
+    probe = subprocess.run([str(venv / "bin/python"), "-c", "import platformio"], check=False)
+    assert probe.returncode != 0, "bare venv unexpectedly has platformio"
+    return venv
+
+
+def _run_cli(
+    cmd: list[str], env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    full_env = {k: v for k, v in os.environ.items() if k != "PIO_LOCK_REEXEC"}
+    full_env.pop("GITHUB_TOKEN", None)
+    full_env.update(env or {})
+    return subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=full_env, timeout=600
+    )
+
+
+def _cli_variants(venv: Path) -> dict[str, list[str]]:
+    return {
+        "script": [str(venv / "bin/python"), str(REPO_ROOT / "pio_lock.py")],
+        "entry_point": [str(venv / "bin/pio-lock")],
+    }
+
+
+def _lockfile(p: Path) -> dict:
+    return json.loads((p / "pio.lock.json").read_text())
+
+
+@requires_pio
+@pytest.mark.parametrize("variant", ["script", "entry_point"])
+def test_cli_from_python_without_platformio(bare_venv: Path, tmp_path: Path, variant: str) -> None:
+    """Covers test_cli_from_python_without_platformio and
+    test_installed_entry_point_without_platformio: the CLI re-runs under PlatformIO's Python."""
+    p = make_native_project(tmp_path / "proj", "[env:native]\nplatform = native\n")
+    cli = _cli_variants(bare_venv)[variant]
+    result = _run_cli([*cli, "-d", str(p), "capture", "-e", "native"])
+    assert result.returncode == 0, result.stdout
+    assert _NOT_FOUND not in result.stdout
+    assert "libraries" in _lockfile(p)["envs"]["native"]
+    # outdated imports platformio in-process: it only works if the CLI re-ran under PIO's Python.
+    outdated = _run_cli([*cli, "-d", str(p), "outdated", "-e", "native", "--json"])
+    assert outdated.returncode == 0, outdated.stdout
+    assert "PlatformIO Python package is required" not in outdated.stdout
+
+
+@requires_pio
+@pytest.mark.xfail(strict=True, reason="capture records the platform from Task 5 (capture v2)")
+@pytest.mark.parametrize("variant", ["script", "entry_point"])
+def test_cli_without_platformio_locks_platform(
+    bare_venv: Path, tmp_path: Path, variant: str
+) -> None:
+    p = make_native_project(tmp_path / "proj", "[env:native]\nplatform = native\n")
+    assert run_pio(p, "pkg", "install", "-e", "native").returncode == 0
+    cli = _cli_variants(bare_venv)[variant]
+    result = _run_cli([*cli, "-d", str(p), "capture", "-e", "native"])
+    assert result.returncode == 0, result.stdout
+    assert _lockfile(p)["envs"]["native"]["platform"]["name"] == "native"
+    assert (p / "pio.lock.ini").exists()
+
+
+@requires_pio
+def test_reexec_not_found_still_locks_libraries(bare_venv: Path, tmp_path: Path) -> None:
+    p = make_native_project(tmp_path / "proj", "[env:native]\nplatform = native\n")
+    no_pio_path = f"{bare_venv / 'bin'}:/usr/bin:/bin"
+    result = _run_cli(
+        [str(bare_venv / "bin/pio-lock"), "-d", str(p), "capture", "-e", "native"],
+        env={"PATH": no_pio_path},
+    )
+    assert result.returncode == 0, result.stdout
+    assert _NOT_FOUND in result.stdout
+    env_lock = _lockfile(p)["envs"]["native"]
+    assert "libraries" in env_lock
+    assert "platform" not in env_lock
+
+
+@requires_pio
+def test_reexec_does_not_loop(bare_venv: Path, tmp_path: Path) -> None:
+    """With PIO_LOCK_REEXEC already set, a Python without platformio never re-execs."""
+    p = make_native_project(tmp_path / "proj", "[env:native]\nplatform = native\n")
+    result = _run_cli(
+        [str(bare_venv / "bin/pio-lock"), "-d", str(p), "capture", "-e", "native"],
+        env={"PIO_LOCK_REEXEC": "1"},
+    )
+    assert result.returncode == 0, result.stdout
+    assert _NOT_FOUND in result.stdout
+    env_lock = _lockfile(p)["envs"]["native"]
+    assert "libraries" in env_lock
+    assert "platform" not in env_lock
