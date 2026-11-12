@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 from dataclasses import asdict
+from dataclasses import replace as dataclasses_replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -1156,3 +1157,233 @@ def test_lock_overrides_none_without_include(tmp_project: Path, fake_pio: Any) -
         "[platformio]\nextra_configs = late.ini\n[env:testenv]\nplatform = espressif32\n"
     )
     assert pio_lock.lock_overrides(tmp_project, "testenv", adapter) == []
+
+
+# ── update: moving each env's platform ───────────────────────────────────────
+
+
+@pytest.fixture
+def platform_update(monkeypatch: pytest.MonkeyPatch, mock_git_commands: Any, fake_pio: Any):
+    """update with no lib_deps and no GitHub; returns (install the fake, pio commands run)."""
+    config = SimpleNamespace(
+        get=lambda section, option, default=None: [] if option == "lib_deps" else default,
+        _parsed=[],
+    )
+    config_cls = SimpleNamespace(get_instance=lambda path=None: config)
+    monkeypatch.setattr(pio_lock, "_pio_import_fn", lambda: (lambda d: None, None, config_cls))
+    monkeypatch.setattr(pio_lock, "_create_github_client_fn", lambda: None)
+
+    def pio_commands() -> list[list[str]]:
+        return [args for args in mock_git_commands if args[:1] == ["pio"]]
+
+    return fake_pio, pio_commands
+
+
+def _platform_install(project: Path, env: str, spec: str) -> list[str]:
+    return [
+        "pio",
+        "pkg",
+        "install",
+        "-d",
+        str(project),
+        "-e",
+        env,
+        "--platform",
+        spec,
+        "--no-save",
+    ]
+
+
+def _move_to(fake: FakePioAdapter, version: str) -> None:
+    """The registry offers ``version``; installing it makes it resolvable."""
+    fake.latest_versions = {"espressif32": version}
+    fake.by_spec = {f"platformio/espressif32@{version}": _lock(version=version)}
+
+
+def test_update_bare_platform_changes_lock_only(
+    tmp_project: Path, platform_update: Any, capsys: Any
+) -> None:
+    install, pio_commands = platform_update
+    ini = (tmp_project / "platformio.ini").read_text()
+    fake = install({"testenv": dataclasses_replace(_lock(), owner="platformio")})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    _move_to(fake, "6.7.0")
+    capsys.readouterr()
+
+    assert pio_lock.update(tmp_project, ["testenv"]) == 0
+    assert (tmp_project / "platformio.ini").read_text() == ini
+    platform = _read_lock(tmp_project)["envs"]["testenv"]["platform"]
+    assert platform["version"] == "6.7.0"
+    assert platform["spec"] == "espressif32"
+    assert "platformio/espressif32@6.7.0" in (tmp_project / "pio.lock.ini").read_text()
+    assert _platform_install(tmp_project, "testenv", "platformio/espressif32@6.7.0") in (
+        pio_commands()
+    )
+    out = capsys.readouterr().out
+    assert "espressif32: 6.6.0 -> 6.7.0" in out
+    assert "edited" not in out
+    assert "platformio.ini changed" not in out
+
+
+def test_update_exact_platform_edits_ini(
+    tmp_project: Path, platform_update: Any, capsys: Any
+) -> None:
+    install, _ = platform_update
+    (tmp_project / "platformio.ini").write_text(
+        "[env:testenv]\nplatform = espressif32@6.6.0\nboard = esp32dev\n"
+    )
+    fake = install({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    _move_to(fake, "6.7.0")
+    capsys.readouterr()
+
+    assert pio_lock.update(tmp_project, ["testenv"]) == 0
+    assert (tmp_project / "platformio.ini").read_text() == (
+        "[env:testenv]\nplatform = espressif32@6.7.0\nboard = esp32dev\n"
+    )
+    platform = _read_lock(tmp_project)["envs"]["testenv"]["platform"]
+    assert (platform["spec"], platform["version"]) == ("espressif32@6.7.0", "6.7.0")
+    out = capsys.readouterr().out
+    assert "espressif32: 6.6.0 -> 6.7.0" in out
+    assert "    edited platformio.ini: espressif32@6.6.0 => espressif32@6.7.0" in out
+    assert "platformio.ini changed — review and commit it with pio.lock.json" in out
+
+
+def test_update_exact_platform_lock_only_installs_without_saving(
+    tmp_project: Path, platform_update: Any
+) -> None:
+    install, _ = platform_update
+    ini = "[env:testenv]\nplatform = espressif32@6.6.0\nboard = esp32dev\n"
+    (tmp_project / "platformio.ini").write_text(ini)
+    fake = install({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    _move_to(fake, "6.7.0")
+
+    assert pio_lock.update(tmp_project, ["testenv"], lock_only=True) == 0
+    assert (tmp_project / "platformio.ini").read_text() == ini
+    assert _read_lock(tmp_project)["envs"]["testenv"]["platform"]["version"] == "6.7.0"
+    assert fake.resolved_with["testenv"] == "platformio/espressif32@6.7.0"
+
+
+def test_update_platform_beyond_range_requires_flag(
+    tmp_project: Path, platform_update: Any, capsys: Any
+) -> None:
+    install, pio_commands = platform_update
+    ini = "[env:testenv]\nplatform = espressif32@^6.6.0\nboard = esp32dev\n"
+    (tmp_project / "platformio.ini").write_text(ini)
+    fake = install({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    _move_to(fake, "7.0.0")
+    capsys.readouterr()
+
+    assert pio_lock.update(tmp_project, ["testenv"]) == 0
+    assert (tmp_project / "platformio.ini").read_text() == ini
+    assert _read_lock(tmp_project)["envs"]["testenv"]["platform"]["version"] == "6.6.0"
+    assert pio_commands() == []
+    assert (
+        "espressif32: 7.0.0 is outside espressif32@^6.6.0; rerun with --beyond-range"
+        in capsys.readouterr().out
+    )
+
+    assert pio_lock.update(tmp_project, ["testenv"], beyond_range=True) == 0
+    assert "platform = espressif32@^7.0.0\n" in (tmp_project / "platformio.ini").read_text()
+    assert _read_lock(tmp_project)["envs"]["testenv"]["platform"]["version"] == "7.0.0"
+
+
+def test_update_platform_in_range(tmp_project: Path, platform_update: Any) -> None:
+    install, _ = platform_update
+    (tmp_project / "platformio.ini").write_text("[env:testenv]\nplatform = espressif32 @ ~6.6.0\n")
+    fake = install({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    _move_to(fake, "6.6.3")
+    assert pio_lock.update(tmp_project, ["testenv"]) == 0
+    assert "platform = espressif32 @ ~6.6.3\n" in (tmp_project / "platformio.ini").read_text()
+
+
+def test_update_edits_platform_in_shared_env_section(
+    tmp_project: Path, platform_update: Any, capsys: Any
+) -> None:
+    install, pio_commands = platform_update
+    (tmp_project / "platformio.ini").write_text(
+        "[env]\nplatform = espressif32@6.6.0\n\n[env:a]\nboard = x\n\n[env:b]\nboard = y\n"
+    )
+    fake = install({"a": _lock(), "b": _lock()})
+    assert pio_lock.capture(tmp_project, ["a", "b"]) == 0
+    _move_to(fake, "6.7.0")
+    capsys.readouterr()
+
+    assert pio_lock.update(tmp_project, ["a", "b"]) == 0
+    assert (tmp_project / "platformio.ini").read_text() == (
+        "[env]\nplatform = espressif32@6.7.0\n\n[env:a]\nboard = x\n\n[env:b]\nboard = y\n"
+    )
+    envs = _read_lock(tmp_project)["envs"]
+    assert envs["a"]["platform"]["version"] == "6.7.0"
+    assert envs["b"]["platform"]["version"] == "6.7.0"
+    out = capsys.readouterr().out
+    assert out.count("edited platformio.ini: espressif32@6.6.0 => espressif32@6.7.0") == 1
+    installs = [c for c in pio_commands() if "--platform" in c]
+    assert len(installs) == 1
+
+
+def test_update_dry_run_platform_writes_nothing(
+    tmp_project: Path, platform_update: Any, capsys: Any
+) -> None:
+    install, pio_commands = platform_update
+    fake = install({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    before = (tmp_project / "pio.lock.json").read_text()
+    _move_to(fake, "6.7.0")
+    capsys.readouterr()
+    assert pio_lock.update(tmp_project, ["testenv"], dry_run=True) == 0
+    assert (tmp_project / "pio.lock.json").read_text() == before
+    assert pio_commands() == []
+    assert "would: espressif32: 6.6.0 -> 6.7.0" in capsys.readouterr().out
+
+
+RELEASE = "https://github.com/pioarduino/platform-espressif32/releases/download/{v}/platform.zip"
+
+
+def test_update_release_url_platform_edits_ini(
+    tmp_project: Path, platform_update: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    install, pio_commands = platform_update
+    old, new = RELEASE.format(v="54.03.20"), RELEASE.format(v="54.03.21")
+    (tmp_project / "platformio.ini").write_text(f"[env:testenv]\nplatform = {old}\n")
+    fake = install({"testenv": _lock(version="54.3.20", src_url=old)})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    fake.by_spec = {new: _lock(version="54.3.21", src_url=new)}
+
+    class GitHub:
+        def get_json(self, path: str) -> Any:
+            if path == "repos/pioarduino/platform-espressif32/releases?per_page=50":
+                return [{"tag_name": "55.03.30"}, {"tag_name": "54.03.21"}]
+            return None
+
+    monkeypatch.setattr(pio_lock, "_create_github_client_fn", lambda: GitHub())
+    capsys.readouterr()
+    assert pio_lock.update(tmp_project, ["testenv"]) == 0
+    assert (tmp_project / "platformio.ini").read_text() == f"[env:testenv]\nplatform = {new}\n"
+    assert _read_lock(tmp_project)["envs"]["testenv"]["platform"]["src_url"] == new
+    assert _platform_install(tmp_project, "testenv", new) in pio_commands()
+    out = capsys.readouterr().out
+    assert "platform-espressif32: 54.03.20 -> 54.03.21" in out
+    assert "55.03.30 is outside" in out
+
+
+def test_locate_env_option_follows_extends_then_env(tmp_path: Path) -> None:
+    main = tmp_path / "platformio.ini"
+    main.write_text(
+        "[platformio]\nextra_configs = shared.ini\n"
+        "[env]\nplatform = espressif32\n"
+        "[env:a]\nextends = base\n[env:b]\nboard = y\n[env:c]\nplatform = native\n"
+    )
+    shared = tmp_path / "shared.ini"
+    shared.write_text("[base]\nplatform = espressif32@6.6.0\n")
+    files = [main, shared]
+    assert pio_lock._locate_env_option(files, "a", "platform") == (
+        shared,
+        "base",
+        "espressif32@6.6.0",
+    )
+    assert pio_lock._locate_env_option(files, "b", "platform") == (main, "env", "espressif32")
+    assert pio_lock._locate_env_option(files, "c", "platform") == (main, "env:c", "native")

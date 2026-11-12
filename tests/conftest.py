@@ -141,7 +141,7 @@ def mock_git_commands(monkeypatch: pytest.MonkeyPatch):
                 ]
             )
 
-        if args[:3] == ["pio", "pkg", "install"]:
+        if args[:2] == ["pio", "pkg"]:
             return ""
 
         # Fall through to real command for anything unexpected

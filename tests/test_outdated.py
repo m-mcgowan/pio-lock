@@ -119,8 +119,23 @@ class FakeConfig:
 
 
 @pytest.fixture
-def mock_pio(monkeypatch, tmp_path):
-    """Set up mock PIO APIs and return a builder for configuring them."""
+def mock_pio(monkeypatch, tmp_path, mock_git_commands):
+    """Set up mock PIO APIs and return a builder for configuring them.
+
+    ``pio`` commands are logged (``run_log``) instead of run, the platform adapter is a fake
+    with no platforms, and ``capture`` is stubbed out, recording its env lists (``captured``).
+    """
+    from tests.fakes import FakePioAdapter
+
+    captured: list[list[str]] = []
+
+    def fake_capture(project_dir, envs, output_path=None, platform_specs=None):
+        captured.append(list(envs))
+        return 0
+
+    monkeypatch.setattr(pio_lock, "capture", fake_capture)
+    adapter = FakePioAdapter(platforms={})
+    monkeypatch.setattr(pio_lock, "_pio_adapter_factory", lambda: adapter)
     packages: dict[str, FakePackageItem] = {}
     outdated_results: dict[str, FakeOutdatedResult] = {}
     lib_deps: dict[str, list[str]] = {}
@@ -154,6 +169,12 @@ def mock_pio(monkeypatch, tmp_path):
     monkeypatch.setattr(pio_lock, "_create_github_client_fn", lambda: None)
 
     class Builder:
+        run_log = mock_git_commands
+        captured_envs = captured
+
+        def pio_commands(self) -> list[list[str]]:
+            return [args for args in self.run_log if args[:1] == ["pio"]]
+
         def add_lib(
             self,
             env: str,
@@ -310,11 +331,12 @@ class TestUpdate:
         out = capsys.readouterr().out
         assert "1.0.0" in out
         assert "1.2.0" in out
-        assert "Dry run" in out
+        assert "would: " in out
         # File should not be modified
         assert (tmp_path / "platformio.ini").read_text() == ini_content
 
-    def test_apply_creates_backup(self, tmp_path, mock_pio):
+    def test_update_writes_no_backup(self, tmp_path, mock_pio):
+        """Config files are under version control; update names its edits, no .bak files."""
         ini_content = "[env:test]\nlib_deps =\n    acme/Foo @ ^1.0.0\n"
         (tmp_path / "platformio.ini").write_text(ini_content)
         mock_pio.add_lib(
@@ -325,10 +347,9 @@ class TestUpdate:
             latest="1.2.0",
             wanted="1.2.0",
         )
-        rc = pio_lock.update(tmp_path, ["test"], dry_run=False)
+        rc = pio_lock.update(tmp_path, ["test"])
         assert rc == 0
-        assert (tmp_path / "platformio.ini.bak").exists()
-        assert (tmp_path / "platformio.ini.bak").read_text() == ini_content
+        assert not (tmp_path / "platformio.ini.bak").exists()
 
     def test_apply_updates_ini(self, tmp_path, mock_pio):
         ini_content = "[env:test]\nlib_deps =\n    acme/Foo @ ^1.0.0\n"
@@ -371,7 +392,7 @@ class TestUpdate:
         assert "Foo" in out
         assert "Bar" not in out
 
-    def test_apply_updates_extra_config(self, tmp_path, mock_pio, monkeypatch):
+    def test_apply_updates_extra_config(self, tmp_path, mock_pio, monkeypatch, capsys):
         """Update finds and modifies the correct extra_configs file."""
         # Main ini references extra config but doesn't declare lib_deps
         (tmp_path / "platformio.ini").write_text(
@@ -379,8 +400,7 @@ class TestUpdate:
         )
         # The lib_deps spec lives in the extra config file
         extra_ini = tmp_path / "shared.ini"
-        extra_content = "[env:test]\nlib_deps =\n    acme/Foo @ ^1.0.0\n"
-        extra_ini.write_text(extra_content)
+        extra_ini.write_text("[env:test]\nlib_deps =\n    acme/Foo @ ^1.0.0\n")
 
         mock_pio.add_lib(
             "test",
@@ -420,9 +440,10 @@ class TestUpdate:
         new_extra = extra_ini.read_text()
         assert "acme/Foo @ ^1.2.0" in new_extra
         assert "acme/Foo @ ^1.0.0" not in new_extra
-        # Backup of extra config
-        assert (tmp_path / "shared.ini.bak").exists()
-        assert (tmp_path / "shared.ini.bak").read_text() == extra_content
+        assert not (tmp_path / "shared.ini.bak").exists()
+        assert "    edited shared.ini: acme/Foo @ ^1.0.0 => acme/Foo @ ^1.2.0" in (
+            capsys.readouterr().out
+        )
 
     def test_update_only_rewrites_lib_deps_block(self, tmp_path, mock_pio):
         """Spec strings outside lib_deps (e.g. in comments) must be left alone."""
@@ -532,6 +553,162 @@ class TestUpdate:
         assert new_ini.count("acme/Foo @ ^1.2.0") == 2
         assert "acme/Foo @ ^1.0.0" not in new_ini
 
+    # ── 0.4.0: apply by default, move the lock ──
+
+    INI = "[env:test]\nlib_deps =\n    acme/Foo @ ^1.0.0\n"
+
+    def _foo(self, mock_pio, wanted="1.2.0", latest="1.2.0", spec="acme/Foo @ ^1.0.0"):
+        mock_pio.add_lib("test", spec, "Foo", "1.0.0", latest=latest, wanted=wanted)
+
+    @staticmethod
+    def _install(tmp_path, flag, spec):
+        return [
+            "pio",
+            "pkg",
+            "install",
+            "-d",
+            str(tmp_path),
+            "-e",
+            "test",
+            flag,
+            spec,
+            "--no-save",
+        ]
+
+    def test_update_applies_by_default(self, tmp_path, mock_pio, capsys):
+        (tmp_path / "platformio.ini").write_text(self.INI)
+        self._foo(mock_pio)
+        rc = pio_lock.update(tmp_path, ["test"])
+        assert rc == 0
+        assert "    acme/Foo @ ^1.2.0\n" in (tmp_path / "platformio.ini").read_text()
+        out = capsys.readouterr().out
+        assert "Foo: 1.0.0 -> 1.2.0" in out
+        assert "    edited platformio.ini: acme/Foo @ ^1.0.0 => acme/Foo @ ^1.2.0" in out
+        assert out.rstrip().endswith(
+            "platformio.ini changed — review and commit it with pio.lock.json"
+        )
+        commands = mock_pio.pio_commands()
+        assert self._install(tmp_path, "--library", "acme/Foo @ ==1.2.0") in commands
+        assert [
+            "pio", "pkg", "uninstall", "-d", str(tmp_path), "-e", "test",
+            "--library", "acme/Foo @ ==1.0.0", "--no-save",
+        ] in commands  # fmt: skip
+        assert mock_pio.captured_envs == [["test"]]
+
+    def test_update_dry_run_writes_nothing(self, tmp_path, mock_pio, capsys):
+        (tmp_path / "platformio.ini").write_text(self.INI)
+        self._foo(mock_pio)
+        rc = pio_lock.update(tmp_path, ["test"], dry_run=True)
+        assert rc == 0
+        assert (tmp_path / "platformio.ini").read_text() == self.INI
+        assert mock_pio.pio_commands() == []
+        assert mock_pio.captured_envs == []
+        assert not (tmp_path / "pio.lock.json").exists()
+        out = capsys.readouterr().out
+        assert "would: Foo: 1.0.0 -> 1.2.0" in out
+        assert "would:     edited platformio.ini: acme/Foo @ ^1.0.0 => acme/Foo @ ^1.2.0" in out
+
+    def test_update_lock_only_leaves_ini(self, tmp_path, mock_pio, capsys):
+        (tmp_path / "platformio.ini").write_text(self.INI)
+        self._foo(mock_pio)
+        rc = pio_lock.update(tmp_path, ["test"], lock_only=True)
+        assert rc == 0
+        assert (tmp_path / "platformio.ini").read_text() == self.INI
+        assert self._install(tmp_path, "--library", "acme/Foo @ ==1.2.0") in (
+            mock_pio.pio_commands()
+        )
+        assert mock_pio.captured_envs == [["test"]]
+        out = capsys.readouterr().out
+        assert "Foo: 1.0.0 -> 1.2.0" in out
+        assert "edited" not in out
+        assert "platformio.ini changed" not in out
+
+    def test_update_bare_library_changes_lock_only(self, tmp_path, mock_pio, capsys):
+        ini = "[env:test]\nlib_deps =\n    acme/Foo\n"
+        (tmp_path / "platformio.ini").write_text(ini)
+        self._foo(mock_pio, wanted="2.0.0", latest="2.0.0", spec="acme/Foo")
+        assert pio_lock.update(tmp_path, ["test"]) == 0
+        assert (tmp_path / "platformio.ini").read_text() == ini
+        assert self._install(tmp_path, "--library", "acme/Foo @ ==2.0.0") in (
+            mock_pio.pio_commands()
+        )
+        assert "Foo: 1.0.0 -> 2.0.0" in capsys.readouterr().out
+
+    def test_update_beyond_range_requires_flag(self, tmp_path, mock_pio, capsys):
+        (tmp_path / "platformio.ini").write_text(self.INI)
+        self._foo(mock_pio, wanted="1.0.0", latest="2.0.0")
+        assert pio_lock.update(tmp_path, ["test"]) == 0
+        assert (tmp_path / "platformio.ini").read_text() == self.INI
+        assert mock_pio.pio_commands() == []
+        assert mock_pio.captured_envs == []
+        out = capsys.readouterr().out
+        assert "Foo: 2.0.0 is outside acme/Foo @ ^1.0.0; rerun with --beyond-range" in out
+
+        assert pio_lock.update(tmp_path, ["test"], beyond_range=True) == 0
+        assert "    acme/Foo @ ^2.0.0\n" in (tmp_path / "platformio.ini").read_text()
+        assert self._install(tmp_path, "--library", "acme/Foo @ ==2.0.0") in (
+            mock_pio.pio_commands()
+        )
+        assert "Foo: 1.0.0 -> 2.0.0" in capsys.readouterr().out
+
+    def test_update_in_range_and_reports_newer_outside(self, tmp_path, mock_pio, capsys):
+        (tmp_path / "platformio.ini").write_text(self.INI)
+        self._foo(mock_pio, wanted="1.2.0", latest="2.0.0")
+        assert pio_lock.update(tmp_path, ["test"]) == 0
+        assert "    acme/Foo @ ^1.2.0\n" in (tmp_path / "platformio.ini").read_text()
+        out = capsys.readouterr().out
+        assert "Foo: 1.0.0 -> 1.2.0" in out
+        assert "Foo: 2.0.0 is outside acme/Foo @ ^1.0.0; rerun with --beyond-range" in out
+
+    def test_update_exact_library_pin_edits_ini(self, tmp_path, mock_pio, capsys):
+        ini = "[env:test]\nlib_deps =\n    acme/Foo @ 1.0.0\n"
+        (tmp_path / "platformio.ini").write_text(ini)
+        self._foo(mock_pio, wanted="1.0.0", latest="1.3.0", spec="acme/Foo @ 1.0.0")
+        assert pio_lock.update(tmp_path, ["test"]) == 0
+        assert "    acme/Foo @ 1.3.0\n" in (tmp_path / "platformio.ini").read_text()
+
+    def test_update_branch_moves_locked_sha_only(self, tmp_path, mock_pio, monkeypatch, capsys):
+        url = "https://github.com/o/r.git"
+        ini = f"[env:test]\nlib_deps =\n    {url}#dev\n"
+        (tmp_path / "platformio.ini").write_text(ini)
+        mock_pio.add_lib("test", f"{url}#dev", "r", f"1.0.0+sha.{LOCKED}", external=True)
+        lock_lib = {"name": "r", "type": "git", "url": url, "sha": LOCKED, "ref": "dev"}
+        lock = {"lockfile_version": 2, "envs": {"test": {"libraries": [lock_lib]}}}
+        (tmp_path / "pio.lock.json").write_text(json.dumps(lock))
+        github = FakeGitHubClient({"repos/o/r/branches/dev": {"commit": {"sha": HEAD}}})
+        monkeypatch.setattr(pio_lock, "_create_github_client_fn", lambda: github)
+
+        assert pio_lock.update(tmp_path, ["test"]) == 0
+        assert (tmp_path / "platformio.ini").read_text() == ini
+        assert self._install(tmp_path, "--library", f"{url}#{HEAD}") in mock_pio.pio_commands()
+        assert mock_pio.captured_envs == [["test"]]
+        out = capsys.readouterr().out
+        assert f"r: {LOCKED[:7]} -> {HEAD[:7]}" in out
+        assert "edited" not in out
+
+    def test_update_tag_ref_edits_ini(self, tmp_path, mock_pio, monkeypatch, capsys):
+        url = "https://github.com/o/r.git"
+        ini = f"[env:test]\nlib_deps =\n    {url}#v1.2.0\n"
+        (tmp_path / "platformio.ini").write_text(ini)
+        mock_pio.add_lib("test", f"{url}#v1.2.0", "r", f"1.2.0+sha.{LOCKED}", external=True)
+        github = FakeGitHubClient(
+            {
+                "repos/o/r/tags?per_page=100": [
+                    {"name": "v2.0.0"},
+                    {"name": "v1.3.0"},
+                    {"name": "v1.2.0"},
+                ]
+            }
+        )
+        monkeypatch.setattr(pio_lock, "_create_github_client_fn", lambda: github)
+
+        assert pio_lock.update(tmp_path, ["test"]) == 0
+        assert f"    {url}#v1.3.0\n" in (tmp_path / "platformio.ini").read_text()
+        assert self._install(tmp_path, "--library", f"{url}#v1.3.0") in mock_pio.pio_commands()
+        out = capsys.readouterr().out
+        assert "r: v1.2.0 -> v1.3.0" in out
+        assert f"r: v2.0.0 is outside {url}#v1.2.0; rerun with --beyond-range" in out
+
 
 # ── Tests for ConfigSourceTracker ─────────────────────────────────────────────
 
@@ -619,6 +796,17 @@ class TestBuildUpdatedSpec:
     def test_gte_range(self):
         result = pio_lock._build_updated_spec("acme/Foo @ >=1.0", "2.0")
         assert result == "acme/Foo @ >=2.0"
+
+    def test_compound_range_is_none(self):
+        assert pio_lock._build_updated_spec("acme/Foo @ >=1.0,<2.0", "1.5.0") is None
+
+    def test_upper_bound_only_is_none(self):
+        """Rewriting ``<2.0`` to ``<1.5.0`` would exclude the version being moved to."""
+        assert pio_lock._build_updated_spec("acme/Foo @ <2.0", "1.5.0") is None
+        assert pio_lock._build_updated_spec("acme/Foo @ >1.0", "1.5.0") is None
+
+    def test_no_space_platform_style(self):
+        assert pio_lock._build_updated_spec("espressif32@6.6.0", "6.7.0") == "espressif32@6.7.0"
 
     def test_no_at_sign(self):
         result = pio_lock._build_updated_spec("SomeLib", "1.0.0")

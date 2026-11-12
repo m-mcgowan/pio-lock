@@ -540,6 +540,45 @@ class TestCLI:
         assert rc == 0
 
 
+class TestUpdateCLI:
+    """update applies by default; --apply is a deprecated no-op."""
+
+    @staticmethod
+    def _run(tmp_project, monkeypatch, *flags):
+        calls = []
+
+        def fake_update(project_dir, envs, **kwargs):
+            calls.append(kwargs)
+            return 0
+
+        monkeypatch.setattr(pio_lock, "update", fake_update)
+        rc = pio_lock.main(["-d", str(tmp_project), "update", "-e", "testenv", *flags])
+        assert rc == 0
+        return calls[0]
+
+    def test_update_apply_flag_is_deprecated_noop(self, tmp_project, monkeypatch, capsys):
+        default = self._run(tmp_project, monkeypatch)
+        assert "deprecated" not in capsys.readouterr().err
+        applied = self._run(tmp_project, monkeypatch, "--apply")
+        assert applied == default
+        assert applied["dry_run"] is False
+        assert (
+            "--apply is deprecated: update applies by default (use --dry-run to preview)"
+            in capsys.readouterr().err
+        )
+
+    def test_update_cli_flags(self, tmp_project, monkeypatch):
+        kwargs = self._run(
+            tmp_project, monkeypatch, "--dry-run", "--lock-only", "--beyond-range", "--lib", "Foo"
+        )
+        assert kwargs == {
+            "dry_run": True,
+            "lib_filter": "Foo",
+            "lock_only": True,
+            "beyond_range": True,
+        }
+
+
 class TestCaptureGitRefs:
     """capture records the requested ref from the lib_deps spec."""
 

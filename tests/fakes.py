@@ -67,9 +67,10 @@ class FakePioAdapter:
     ``platforms`` maps env -> the PlatformLock ``resolve_platform`` returns (missing env ->
     PlatformNotInstalled), with ``spec``/``platform_packages_spec`` read from the user's config
     view as the real adapter does. ``in_use`` maps env -> ``platform_in_use`` result
-    (defaults to the locked name/version). ``installed_packages`` is the set of (name, version)
-    ``package_installed`` accepts (default: every package of ``platforms``). ``incompatible``
-    names a call: probe/resolve/in_use then raise PioIncompatible.
+    (defaults to the locked name/version). ``by_spec`` maps an installed-package spec ->
+    PlatformLock for ``resolve_platform(..., installed_spec=...)``. ``installed_packages`` is
+    the set of (name, version) ``package_installed`` accepts (default: every package of
+    ``platforms``). ``incompatible`` names a call: probe/resolve/in_use then raise PioIncompatible.
     Config views are real configparser reads of the project.
     """
 
@@ -81,8 +82,11 @@ class FakePioAdapter:
         core: str = "6.1.18",
         installed_packages: Optional[set[tuple[str, str]]] = None,
         latest_versions: Optional[dict[str, Optional[str]]] = None,
+        by_spec: Optional[dict[str, PlatformLock]] = None,
     ) -> None:
         self.platforms = platforms
+        self.by_spec = by_spec or {}
+        self.resolved_with: dict[str, Optional[str]] = {}
         self.in_use = in_use or {}
         self.incompatible = incompatible
         self.core = core
@@ -108,17 +112,26 @@ class FakePioAdapter:
     def config_files(self, project_dir: Path) -> list[Path]:
         return _read_view(project_dir, include_lock_ini=True)[1]
 
-    def resolve_platform(self, project_dir: Path, env: str) -> PlatformLock:
+    def resolve_platform(
+        self, project_dir: Path, env: str, installed_spec: Optional[str] = None
+    ) -> PlatformLock:
+        """``installed_spec`` (the installed package to look up) picks from ``by_spec`` when
+        listed there; otherwise the env's entry in ``platforms`` is returned."""
         self._check()
+        self.resolved_with[env] = installed_spec
         # Like the real adapter, the spec and user platform_packages come from the user's view.
         view = self.user_config(project_dir)
         spec = view.get(f"env:{env}", "platform", None)
         if not spec:
             raise ValueError(f"env '{env}' has no platform")
-        if env not in self.platforms:
+        if installed_spec is not None and installed_spec in self.by_spec:
+            found = self.by_spec[installed_spec]
+        elif env in self.platforms:
+            found = self.platforms[env]
+        else:
             raise PlatformNotInstalled(env)
         return dataclasses.replace(
-            self.platforms[env],
+            found,
             spec=str(spec),
             platform_packages_spec=list(view.get(f"env:{env}", "platform_packages", [])),
         )
