@@ -515,3 +515,30 @@ def test_check_warn_only_on_real_project(tmp_path: Path) -> None:
     env_warned = run("check", "-e", "native", env={"PIO_LOCK_DRIFT": "warn"})
     assert env_warned.returncode == 0, env_warned.stdout
     assert "WARNING:" in env_warned.stdout
+
+
+@requires_pio
+def test_real_adapter_package_installed(tmp_path: Path) -> None:
+    # The native platform has no packages of its own, so probe whatever tool is installed.
+    code = """
+import json, sys
+from pio_lock import PioAdapter
+from platformio.package.manager.tool import ToolPackageManager
+adapter = PioAdapter()
+installed = ToolPackageManager().get_installed()
+if not installed:
+    print(json.dumps({"skip": True}))
+    sys.exit(0)
+meta = installed[0].metadata
+real = {"name": meta.name, "version": str(meta.version), "owner": meta.spec.owner}
+print(json.dumps({
+    "skip": False,
+    "exact": adapter.package_installed(real),
+    "wrong": adapter.package_installed({**real, "version": "0.0.0-nope"}),
+}))
+"""
+    out = run_in_pio_python(code, cwd=tmp_path)
+    if out["skip"]:
+        pytest.skip("no tool packages installed")
+    assert out["exact"] is True
+    assert out["wrong"] is False

@@ -67,8 +67,10 @@ class FakePioAdapter:
     ``platforms`` maps env -> the PlatformLock ``resolve_platform`` returns (missing env ->
     PlatformNotInstalled), with ``spec``/``platform_packages_spec`` read from the user's config
     view as the real adapter does. ``in_use`` maps env -> ``platform_in_use`` result
-    (defaults to the locked name/version). ``incompatible`` names a call: probe/resolve/in_use
-    then raise PioIncompatible. Config views are real configparser reads of the project.
+    (defaults to the locked name/version). ``installed_packages`` is the set of (name, version)
+    ``package_installed`` accepts (default: every package of ``platforms``). ``incompatible``
+    names a call: probe/resolve/in_use then raise PioIncompatible.
+    Config views are real configparser reads of the project.
     """
 
     def __init__(
@@ -77,11 +79,13 @@ class FakePioAdapter:
         in_use: Optional[dict[str, tuple[str, str]]] = None,
         incompatible: Optional[str] = None,
         core: str = "6.1.18",
+        installed_packages: Optional[set[tuple[str, str]]] = None,
     ) -> None:
         self.platforms = platforms
         self.in_use = in_use or {}
         self.incompatible = incompatible
         self.core = core
+        self.installed_packages = installed_packages
 
     def _check(self) -> None:
         if self.incompatible:
@@ -116,6 +120,18 @@ class FakePioAdapter:
             spec=str(spec),
             platform_packages_spec=list(view.get(f"env:{env}", "platform_packages", [])),
         )
+
+    def package_installed(
+        self, package: dict[str, Any], project_dir: Optional[Path] = None
+    ) -> bool:
+        self._check()
+        if self.installed_packages is None:
+            installed = {
+                (p.name, p.version) for lock in self.platforms.values() for p in lock.packages
+            }
+        else:
+            installed = self.installed_packages
+        return (package["name"], package["version"]) in installed
 
     def platform_in_use(self, project_dir: Path, env: str) -> tuple[str, str]:
         self._check()

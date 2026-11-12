@@ -619,6 +619,25 @@ def render_lock_ini(lockdata: dict[str, Any]) -> str:
     return "".join(lines)
 
 
+def _lock_staleness(
+    platform: dict[str, Any], user_platform_spec: str, user_platform_packages: list[str]
+) -> list[str]:
+    """Why a locked platform no longer matches the user's config (empty when it matches)."""
+    problems: list[str] = []
+    if platform.get("spec") != user_platform_spec:
+        problems.append(
+            f"platform spec changed: '{platform.get('spec')}' → '{user_platform_spec}'; "
+            "run capture"
+        )
+    locked_packages = list(platform.get("platform_packages_spec", []))
+    if locked_packages != list(user_platform_packages):
+        problems.append(
+            f"platform_packages changed: {locked_packages} → {list(user_platform_packages)}; "
+            "run capture"
+        )
+    return problems
+
+
 def env_lock_is_stale(
     env_lock: dict[str, Any], user_platform_spec: str, user_platform_packages: list[str]
 ) -> bool:
@@ -629,10 +648,7 @@ def env_lock_is_stale(
     platform = env_lock.get("platform")
     if not platform:
         return True
-    return bool(
-        platform.get("spec") != user_platform_spec
-        or list(platform.get("platform_packages_spec", [])) != list(user_platform_packages)
-    )
+    return bool(_lock_staleness(platform, user_platform_spec, user_platform_packages))
 
 
 def capture(
@@ -777,7 +793,7 @@ def restore(project_dir: Path, envs: list[str]) -> int:
             if _restore_platform(project_dir, env_name, platform) != 0:
                 return 1
         else:
-            print(f"  Platform for {env_name} not locked (lockfile is v1); skipping platform")
+            print(f"  Platform for {env_name}: env has no locked platform; run capture")
 
         libraries = lockdata["envs"][env_name]["libraries"]
         print(f"Restoring {len(libraries)} libraries for {env_name}...")
@@ -834,47 +850,40 @@ def _drift_policy_from_env() -> Optional[str]:
 
 
 def platform_drift(
-    project_dir: Path, env: str, env_lock: dict[str, Any], adapter: Any
+    project_dir: Path, env: str, env_lock: dict[str, Any], adapter: PioAdapter
 ) -> list[str]:
     """Human-readable differences between the locked platform and what's configured/installed.
 
     Empty when the env lock has no platform, or when everything matches. May raise
-    PioIncompatible (the caller decides how to report that).
+    PioIncompatible (the caller decides how to report that) or ValueError (bad config).
     """
     platform = env_lock.get("platform")
     if not platform:
         return []
-    problems: list[str] = []
 
     config = adapter.user_config(project_dir)
     section = f"env:{env}"
-    spec = str(config.get(section, "platform", "") or "")
-    user_packages = list(config.get(section, "platform_packages", []) or [])
-    if platform.get("spec") != spec:
-        problems.append(f"platform spec changed: '{platform.get('spec')}' → '{spec}'; run capture")
-    locked_packages = list(platform.get("platform_packages_spec", []))
-    if locked_packages != user_packages:
-        problems.append(
-            f"platform_packages changed: {locked_packages} → {user_packages}; run capture"
-        )
+    try:
+        spec = str(config.get(section, "platform", "") or "")
+        user_packages = [str(p) for p in config.get(section, "platform_packages", []) or []]
+    except (AttributeError, TypeError) as exc:
+        raise PioIncompatible(
+            "platformio.project.config.ProjectConfig.get", adapter.core_version(), _describe(exc)
+        ) from exc
+    problems = _lock_staleness(platform, spec, user_packages)
 
     try:
         name, version = adapter.platform_in_use(project_dir, env)
-        if version != platform["version"]:
-            problems.append(f"platform {name}: locked {platform['version']}, in use {version}")
-        installed = {
-            pkg.name: pkg.version for pkg in adapter.resolve_platform(project_dir, env).packages
-        }
     except PlatformNotInstalled:
         problems.append(
             f"platform {platform['name']} {platform['version']} is not installed; run restore"
         )
         return problems
+    if version != platform["version"]:
+        problems.append(f"platform {name}: locked {platform['version']}, in use {version}")
     for pkg in platform.get("packages", []):
-        have = installed.get(pkg["name"])
-        if have != pkg["version"]:
-            state = "not installed" if have is None else f"installed {have}"
-            problems.append(f"package {pkg['name']}: locked {pkg['version']}, {state}")
+        if not adapter.package_installed(pkg, project_dir):
+            problems.append(f"package {pkg['name']}: locked {pkg['version']} is not installed")
     return problems
 
 
@@ -893,7 +902,8 @@ def check(project_dir: Path, envs: list[str], warn_only: bool = False) -> int:
     warn = warn_only or _drift_policy_from_env() == "warn"
     label = "WARNING" if warn else "DRIFT"
     problems_found = False
-    adapter: Optional[Any] = None
+    adapter: Optional[PioAdapter] = None
+    platform_checked = False
 
     if lockdata["lockfile_version"] < 2:
         print("platform not checked: lockfile is v1; run capture to lock the platform")
@@ -915,9 +925,14 @@ def check(project_dir: Path, envs: list[str], warn_only: bool = False) -> int:
                 try:
                     if adapter is None:
                         adapter = _pio_adapter_factory()
-                    for problem in platform_drift(project_dir, env_name, env_lock, adapter):
+                    drift = platform_drift(project_dir, env_name, env_lock, adapter)
+                    platform_checked = True
+                    for problem in drift:
                         problems_found = True
                         print(f"  {label}: {problem}")
+                except ValueError as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    return 1
                 except PioIncompatible as exc:
                     # Not drift: the platform can't be inspected. Libraries are still checked.
                     print(f"  WARNING: platform not checked: {exc}")
@@ -939,7 +954,10 @@ def check(project_dir: Path, envs: list[str], warn_only: bool = False) -> int:
     if problems_found:
         print("Lockfile check FAILED — installed state differs from lockfile")
         return 1
-    print("Lockfile check passed — all libraries match")
+    if platform_checked:
+        print("Lockfile check passed — libraries, platform and packages match")
+    else:
+        print("Lockfile check passed — all libraries match")
     return 0
 
 
@@ -1042,6 +1060,7 @@ _PIO_INTERNALS: tuple[tuple[str, str], ...] = (
     ("platformio.project.config", "ProjectConfig.items"),
     ("platformio.project.config", "ProjectConfig.BUILTIN_VARS"),
     ("platformio.package.manager.platform", "PlatformPackageManager.get_package"),
+    ("platformio.package.manager.tool", "ToolPackageManager.get_installed"),
     ("platformio.platform.factory", "PlatformFactory.new"),
     ("platformio.platform.base", "PlatformBase.configure_project_packages"),
     ("platformio.platform.base", "PlatformBase.packages"),
@@ -1248,6 +1267,30 @@ class PioAdapter:
                     )
                 )
         return result
+
+    def package_installed(
+        self, package: dict[str, Any], project_dir: Optional[Path] = None
+    ) -> bool:
+        """Whether ``package`` (a locked package dict) is installed at exactly its locked version.
+
+        Looks for the exact spec first, then matches by name and exact version among the
+        installed tool packages (which also covers packages with no exact spec, e.g. file://).
+        """
+        manager_cls = self._lookup("platformio.package.manager.tool", "ToolPackageManager")
+        name, version = str(package["name"]), str(package["version"])
+        call = "platformio.package.manager.tool.ToolPackageManager"
+        cwd = _chdir(project_dir) if project_dir else contextlib.nullcontext()
+        with cwd, self._calling(call):
+            manager = manager_cls()
+            if not package.get("src_url"):
+                spec = _package_exact_spec(package)
+                found = manager.get_package(spec) if spec else None
+                if found is not None and str(found.metadata.version) == version:
+                    return True
+            return any(
+                str(pkg.metadata.name) == name and str(pkg.metadata.version) == version
+                for pkg in manager.get_installed()
+            )
 
     def platform_in_use(self, project_dir: Path, env: str) -> tuple[str, str]:
         """(name, version) of the platform a build of ``env`` uses (pio.lock.ini included)."""

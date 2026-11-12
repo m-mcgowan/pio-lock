@@ -37,6 +37,16 @@ class _StubPlatformPackageManager:
         return self.installed.get(spec)
 
 
+class _StubToolPackageManager:
+    installed: ClassVar[list[Any]] = []
+
+    def get_package(self, spec: str) -> Any:
+        return None
+
+    def get_installed(self) -> list[Any]:
+        return self.installed
+
+
 class _StubPlatformBase:
     packages: ClassVar[dict[str, Any]] = {}
 
@@ -55,6 +65,9 @@ def _stub_modules(**overrides: Any) -> dict[str, Any]:
         ),
         "platformio.package.manager.platform": SimpleNamespace(
             PlatformPackageManager=_StubPlatformPackageManager
+        ),
+        "platformio.package.manager.tool": SimpleNamespace(
+            ToolPackageManager=_StubToolPackageManager
         ),
         "platformio.platform.factory": SimpleNamespace(PlatformFactory=SimpleNamespace(new=None)),
         "platformio.platform.base": SimpleNamespace(PlatformBase=_StubPlatformBase),
@@ -814,18 +827,32 @@ def test_check_reports_package_drift(tmp_project: Path, fake_pio: Any, capsys: A
         ]
     )
     _locked_project(tmp_project, fake_pio, locked)
-    installed = _lock(
-        packages=[
-            PackageLock("toolchain-xtensa", "8.5.0", owner="espressif"),
-            PackageLock("tool-local", "0.9.0", src_url="file:///opt/tool-local"),
-        ]
+    # The user view resolves newer packages, but only these exact versions are installed.
+    fake_pio(
+        {"testenv": locked},
+        installed_packages={("toolchain-xtensa", "8.5.0"), ("tool-local", "1.0.0")},
     )
-    fake_pio({"testenv": installed})
     assert pio_lock.check(tmp_project, ["testenv"]) == 1
     out = capsys.readouterr().out
-    assert "package toolchain-xtensa: locked 8.4.0, installed 8.5.0" in out
-    assert "package tool-local: locked 1.0.0, installed 0.9.0" in out
-    assert "package tool-gone: locked 2.0.0, not installed" in out
+    assert "package toolchain-xtensa: locked 8.4.0 is not installed" in out
+    assert "package tool-gone: locked 2.0.0 is not installed" in out
+    assert "tool-local" not in out
+
+
+def test_check_ignores_newer_installed_package_when_locked_one_is_installed(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    locked = _lock(packages=[PackageLock("toolchain-xtensa", "8.4.0", owner="espressif")])
+    _locked_project(tmp_project, fake_pio, locked)
+    # What the user's view resolves (highest installed) is newer than the lock.
+    newer = _lock(packages=[PackageLock("toolchain-xtensa", "8.4.1", owner="espressif")])
+    fake_pio(
+        {"testenv": newer},
+        in_use={"testenv": ("espressif32", "6.6.0")},
+        installed_packages={("toolchain-xtensa", "8.4.0"), ("toolchain-xtensa", "8.4.1")},
+    )
+    assert pio_lock.check(tmp_project, ["testenv"]) == 0
+    assert "DRIFT" not in capsys.readouterr().out
 
 
 def test_check_platform_not_installed_is_drift(
@@ -989,3 +1016,35 @@ def test_restore_v1_lockfile_installs_libraries_only(
     calls = _install_calls(mock_git_commands)
     assert len(calls) == 1
     assert "--platform" not in calls[0]
+
+
+def _tool(name: str, version: str) -> Any:
+    return SimpleNamespace(metadata=SimpleNamespace(name=name, version=version))
+
+
+def test_real_adapter_package_installed_matches_exact_version(monkeypatch: Any) -> None:
+    monkeypatch.setattr(_StubToolPackageManager, "installed", [_tool("tool-a", "1.0.1")])
+    adapter = _StubAdapter(_stub_modules())
+    assert not adapter.package_installed({"name": "tool-a", "version": "1.0.0", "owner": "o"})
+    monkeypatch.setattr(
+        _StubToolPackageManager, "installed", [_tool("tool-a", "1.0.1"), _tool("tool-a", "1.0.0")]
+    )
+    assert adapter.package_installed({"name": "tool-a", "version": "1.0.0", "owner": "o"})
+    # file:// packages have no exact spec: matched by name and version.
+    assert adapter.package_installed(
+        {"name": "tool-a", "version": "1.0.1", "src_url": "file:///opt/a"}
+    )
+
+
+def test_real_adapter_package_installed_incompatible_api() -> None:
+    adapter = _StubAdapter(
+        _stub_modules(), broken={"platformio.package.manager.tool": ImportError("x")}
+    )
+    with pytest.raises(PioIncompatible):
+        adapter.package_installed({"name": "tool-a", "version": "1.0.0"})
+
+
+def test_check_malformed_ini_is_clean_error(tmp_project: Path, fake_pio: Any, capsys: Any) -> None:
+    _locked_project(tmp_project, fake_pio, _lock())
+    (tmp_project / "platformio.ini").write_text("[env:testenv]\nboard = x\n")
+    assert pio_lock.check(tmp_project, ["testenv"]) == 1  # stale spec: platform now ''
