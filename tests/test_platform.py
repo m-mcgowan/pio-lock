@@ -24,6 +24,7 @@ from pio_lock import (
     PlatformLock,
     PlatformNotInstalled,
 )
+from tests.conftest import write_lockfile
 from tests.fakes import FakePioAdapter
 
 # ── Stub PlatformIO modules ─────────────────────────────────────────────────
@@ -479,14 +480,18 @@ def test_lock_ini_keeps_user_platform_packages(tmp_project: Path, fake_pio: Any)
     (tmp_project / "platformio.ini").write_text(
         f"[env:testenv]\nplatform = espressif32\nplatform_packages =\n  {user_pkg}\n"
     )
-    git_url = "https://github.com/espressif/arduino-esp32.git#abc123"
+    # PlatformIO records the git source in its normalized git+ form.
+    git_url = "git+https://github.com/espressif/arduino-esp32.git#abc123"
     fake_pio(
         {
             "testenv": _lock(
                 platform_packages_spec=[user_pkg],
                 packages=[
                     PackageLock(
-                        "framework-arduinoespressif32", "3.0.0", owner=None, src_url=git_url
+                        "framework-arduinoespressif32",
+                        "3.0.0+sha.abc123",
+                        owner=None,
+                        src_url=git_url,
                     ),
                     PackageLock("toolchain-xtensa-esp32", "8.4.0", owner="espressif"),
                 ],
@@ -498,7 +503,10 @@ def test_lock_ini_keeps_user_platform_packages(tmp_project: Path, fake_pio: Any)
     assert platform["platform_packages_spec"] == [user_pkg]
     assert platform["packages"][0]["src_url"] == git_url
     ini = (tmp_project / "pio.lock.ini").read_text()
-    assert f"  {user_pkg}\n" in ini
+    assert (
+        "  framework-arduinoespressif32 @ "
+        "git+https://github.com/espressif/arduino-esp32.git#abc123\n"
+    ) in ini
 
 
 def test_lock_ini_omits_local_file_packages() -> None:
@@ -615,3 +623,134 @@ def test_env_lock_is_stale() -> None:
     assert pio_lock.env_lock_is_stale(env_lock, "espressif32@6.7.0", ["tool-a @ 1.0"])
     assert pio_lock.env_lock_is_stale(env_lock, "espressif32", [])
     assert pio_lock.env_lock_is_stale({"libraries": []}, "espressif32", [])
+
+
+# ── capture fix round 1 ──────────────────────────────────────────────────────
+
+
+def test_capture_unknown_env_fails_cleanly(tmp_project: Path, fake_pio: Any, capsys: Any) -> None:
+    fake_pio({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv", "nope"]) == 1
+    assert "Error: env 'nope' not found in platformio.ini" in capsys.readouterr().err
+    assert not (tmp_project / "pio.lock.json").exists()
+    assert not (tmp_project / "pio.lock.ini").exists()
+
+
+def test_capture_env_without_platform_fails_cleanly(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    (tmp_project / "platformio.ini").write_text("[env:testenv]\nboard = esp32dev\n")
+    fake_pio({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 1
+    assert "Error: env 'testenv' has no platform in platformio.ini" in capsys.readouterr().err
+    assert not (tmp_project / "pio.lock.json").exists()
+
+
+def test_fake_adapter_raises_like_real_for_env_without_platform(tmp_project: Path) -> None:
+    fake = FakePioAdapter(platforms={"nope": _lock()})
+    with pytest.raises(ValueError, match="env 'nope' has no platform"):
+        fake.resolve_platform(tmp_project, "nope")
+
+
+_GIT_PLATFORM = "git+https://github.com/platformio/platform-espressif32.git"
+
+
+def _ini_for(platform: PlatformLock) -> str:
+    return pio_lock.render_lock_ini({"envs": {"e": {"platform": asdict(platform)}}})
+
+
+def test_lock_ini_pins_git_platform_to_resolved_sha() -> None:
+    ini = _ini_for(
+        _lock(
+            spec=f"{_GIT_PLATFORM}#main",
+            version="6.6.0+sha.1a2b3c4",
+            src_url=f"{_GIT_PLATFORM}#main",
+        )
+    )
+    assert f"platform = {_GIT_PLATFORM}#1a2b3c4\n" in ini
+
+
+def test_lock_ini_pins_unpinned_git_platform() -> None:
+    ini = _ini_for(_lock(spec=_GIT_PLATFORM, version="6.6.0+sha.1a2b3c4", src_url=_GIT_PLATFORM))
+    assert f"platform = {_GIT_PLATFORM}#1a2b3c4\n" in ini
+
+
+def test_lock_ini_pins_git_package_to_resolved_sha() -> None:
+    url = "git+https://github.com/espressif/arduino-esp32.git#master"
+    ini = _ini_for(
+        _lock(
+            packages=[
+                PackageLock("framework-arduinoespressif32", "3.0.0+sha.9f8e7d6", src_url=url)
+            ]
+        )
+    )
+    assert (
+        "  framework-arduinoespressif32 @ "
+        "git+https://github.com/espressif/arduino-esp32.git#9f8e7d6\n"
+    ) in ini
+
+
+def test_lock_ini_keeps_git_url_without_sha_and_warns(capsys: Any) -> None:
+    ini = _ini_for(_lock(spec=_GIT_PLATFORM, version="6.6.0", src_url=_GIT_PLATFORM))
+    assert f"platform = {_GIT_PLATFORM}\n" in ini
+    assert _GIT_PLATFORM in capsys.readouterr().err
+
+
+def test_lock_ini_leaves_release_zip_url_alone() -> None:
+    ini = _ini_for(
+        _lock(spec=_PIOARDUINO_URL, version="54.3.20+sha.abc1234", src_url=_PIOARDUINO_URL)
+    )
+    assert f"platform = {_PIOARDUINO_URL}\n" in ini
+
+
+def test_lock_ini_uses_platform_owner() -> None:
+    lock = _lock(name="myplatform", version="1.2.3")
+    lock.owner = "acme"
+    assert "platform = acme/myplatform@1.2.3\n" in _ini_for(lock)
+
+
+def test_capture_records_platform_owner(tmp_project: Path, fake_pio: Any) -> None:
+    lock = _lock()
+    lock.owner = "acme"
+    fake_pio({"testenv": lock})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    assert _read_lock(tmp_project)["envs"]["testenv"]["platform"]["owner"] == "acme"
+
+
+def test_capture_incompatible_keeps_previous_platform(
+    tmp_project: Path, fake_pio: Any, make_registry_lib: Any, capsys: Any
+) -> None:
+    fake_pio({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    make_registry_lib("testenv", "MyLib", "1.0.0", project_dir=tmp_project)
+    fake_pio({"testenv": _lock()}, incompatible="PlatformFactory.new")
+    capsys.readouterr()
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    env_lock = _read_lock(tmp_project)["envs"]["testenv"]
+    assert env_lock["platform"]["version"] == "6.6.0"
+    assert [lib["name"] for lib in env_lock["libraries"]] == ["MyLib"]
+    assert (
+        "platform for env 'testenv' not re-captured (PlatformIO incompatible); "
+        "keeping the previous lock"
+    ) in capsys.readouterr().err
+    assert "[env:testenv]" in (tmp_project / "pio.lock.ini").read_text()
+
+
+def test_capture_upgrades_v1_lockfile(tmp_project: Path, fake_pio: Any) -> None:
+    (tmp_project / "platformio.ini").write_text(
+        "[env]\nplatform = espressif32\n[env:testenv]\n[env:legacy]\n"
+    )
+    write_lockfile(
+        tmp_project,
+        {"legacy": [{"name": "Old", "type": "registry", "version": "1.0.0", "owner": "o"}]},
+    )
+    fake_pio({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    data = _read_lock(tmp_project)
+    assert data["lockfile_version"] == 2
+    assert "global_packages" not in data
+    assert "platform_url" not in data
+    assert data["envs"]["legacy"] == {
+        "libraries": [{"name": "Old", "type": "registry", "version": "1.0.0", "owner": "o"}]
+    }
+    assert "platform" in data["envs"]["testenv"]

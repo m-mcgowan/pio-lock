@@ -549,9 +549,30 @@ def load_lockfile(path: Path) -> dict[str, Any]:
     return data
 
 
+_GIT_SHA_SUFFIX_RE = re.compile(r"\+sha\.([0-9a-f]+)$")
+
+
+def _pinned_src_url(src_url: str, version: str) -> str:
+    """``src_url`` pinned to the resolved commit for git sources.
+
+    PlatformIO records the requested URI (which may name a branch or no ref at all) and puts
+    the resolved commit in the version's ``+sha.<rev>`` suffix. Other URLs are returned as-is.
+    """
+    if not src_url.startswith("git+"):
+        return src_url
+    match = _GIT_SHA_SUFFIX_RE.search(version)
+    if not match:
+        print(
+            f"  Warning: no resolved commit recorded for {src_url}; {LOCK_INI_NAME} can't pin it",
+            file=sys.stderr,
+        )
+        return src_url
+    return f"{src_url.split('#', 1)[0]}#{match.group(1)}"
+
+
 def _platform_exact_spec(platform: dict[str, Any]) -> str:
     if platform.get("src_url"):
-        return str(platform["src_url"])
+        return _pinned_src_url(str(platform["src_url"]), str(platform["version"]))
     owner = platform.get("owner") or "platformio"
     return f"{owner}/{platform['name']}@{platform['version']}"
 
@@ -563,7 +584,7 @@ def _package_exact_spec(package: dict[str, Any]) -> Optional[str]:
         if str(src_url).startswith("file://"):
             return None  # a local path in a committed file would break other machines
         # The name keeps PlatformIO treating it as an override of the platform's package.
-        return f"{package['name']} @ {src_url}"
+        return f"{package['name']} @ {_pinned_src_url(str(src_url), str(package['version']))}"
     owner = package.get("owner")
     prefix = f"{owner}/" if owner else ""
     return f"{prefix}{package['name']}@{package['version']}"
@@ -628,8 +649,26 @@ def capture(
         print(f"Error: no platformio.ini in {project_dir}", file=sys.stderr)
         return 1
 
-    print(f"Capturing dependency state for: {', '.join(envs)}")
     adapter = _pio_adapter_factory()
+    try:
+        config: Any = adapter.user_config(project_dir)
+        configured: Optional[set[str]] = set(config.envs())
+    except PioIncompatible:
+        config, configured = None, None  # can't read the config: no validation, no pruning
+    if config is not None and configured is not None:
+        for env_name in envs:
+            if env_name not in configured:
+                print(f"Error: env '{env_name}' not found in platformio.ini", file=sys.stderr)
+                return 1
+            if not config.get(f"env:{env_name}", "platform", None):
+                print(
+                    f"Error: env '{env_name}' has no platform in platformio.ini", file=sys.stderr
+                )
+                return 1
+
+    print(f"Capturing dependency state for: {', '.join(envs)}")
+    dest = output_path or (project_dir / LOCKFILE_NAME)
+    previous = load_lockfile(dest).get("envs", {}) if dest.exists() else {}
 
     captured: dict[str, dict[str, Any]] = {}
     for env_name in envs:
@@ -639,8 +678,18 @@ def capture(
             env_lock["platform"] = asdict(adapter.resolve_platform(project_dir, env_name))
             print(f"    Platform {env_lock['platform']['name']} {env_lock['platform']['version']}")
         except PioIncompatible as exc:
-            print(f"  Warning: {exc}; platform not locked for {env_name}", file=sys.stderr)
-        except PlatformNotInstalled as exc:
+            print(f"  Warning: {exc}", file=sys.stderr)
+            previous_platform = previous.get(env_name, {}).get("platform")
+            if previous_platform:
+                env_lock["platform"] = previous_platform
+                print(
+                    f"  Warning: platform for env '{env_name}' not re-captured "
+                    "(PlatformIO incompatible); keeping the previous lock",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"  Warning: platform not locked for {env_name}", file=sys.stderr)
+        except (PlatformNotInstalled, ValueError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
         libraries = [
@@ -650,14 +699,7 @@ def capture(
         captured[env_name] = env_lock
         print(f"    Found {len(libraries)} libraries")
 
-    dest = output_path or (project_dir / LOCKFILE_NAME)
-    previous = load_lockfile(dest).get("envs", {}) if dest.exists() else {}
     merged: dict[str, Any] = {**previous, **captured}
-
-    try:
-        configured: Optional[set[str]] = set(adapter.user_config(project_dir).envs())
-    except PioIncompatible:
-        configured = None  # can't read the config: keep every env
     if configured is not None:
         for env_name in sorted(set(merged) - configured - set(captured)):
             del merged[env_name]
@@ -842,6 +884,7 @@ class PlatformLock:
     version: str
     src_url: Optional[str]
     packages: list[PackageLock]
+    owner: Optional[str] = None
 
 
 class PioIncompatible(Exception):  # noqa: N818 (name fixed by the 0.4.0 interface)
@@ -1047,6 +1090,7 @@ class PioAdapter:
                 name = str(meta.name)
                 version = str(meta.version)
                 src_url = str(meta.spec.uri) if meta.spec.external else None
+                owner = str(meta.spec.owner) if meta.spec.owner else None
         return PlatformLock(
             spec=spec,
             platform_packages_spec=platform_packages,
@@ -1054,6 +1098,7 @@ class PioAdapter:
             version=version,
             src_url=src_url,
             packages=packages,
+            owner=owner,
         )
 
     def _used_packages(self, platform: Any, env: str) -> list[PackageLock]:

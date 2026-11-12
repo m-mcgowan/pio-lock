@@ -104,13 +104,16 @@ class FakePioAdapter:
 
     def resolve_platform(self, project_dir: Path, env: str) -> PlatformLock:
         self._check()
-        if env not in self.platforms:
-            raise PlatformNotInstalled(env)
         # Like the real adapter, the spec and user platform_packages come from the user's view.
         view = self.user_config(project_dir)
+        spec = view.get(f"env:{env}", "platform", None)
+        if not spec:
+            raise ValueError(f"env '{env}' has no platform")
+        if env not in self.platforms:
+            raise PlatformNotInstalled(env)
         return dataclasses.replace(
             self.platforms[env],
-            spec=str(view.get(f"env:{env}", "platform", self.platforms[env].spec)),
+            spec=str(spec),
             platform_packages_spec=list(view.get(f"env:{env}", "platform_packages", [])),
         )
 
