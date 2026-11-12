@@ -29,7 +29,10 @@ pio-lock is a single file, `pio_lock.py`. That is deliberate: the same file is
 4. the `pio-lock` command-line tool (`main()`).
 
 Keep it importable without PlatformIO installed. PlatformIO is imported lazily, inside `PioAdapter`
-methods, so the unit tests and the CLI's first few lines run on any Python 3.9+.
+methods, so the unit tests and the CLI's first few lines run on any Python 3.9+. The "without PlatformIO"
+tests in `tests/test_packaging.py` enforce this. They block `platformio` in a fresh interpreter, then
+import the module and run `--help`, `capture` and `check`. Because of the block, they still catch a stray
+import on a machine that has PlatformIO installed.
 
 ```mermaid
 flowchart TB
