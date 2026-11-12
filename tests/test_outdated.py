@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 from unittest.mock import MagicMock
 
 import pytest
@@ -892,19 +892,112 @@ class TestUpdate:
         assert "already removed: acme/Foo @ ==1.0.0" not in err
         assert "could not remove acme/Foo @ ==1.0.0" in err
 
-    def test_update_lock_only_beyond_range_unrewritable_spec_moves_lock(
+    def test_update_lock_only_beyond_range_unrewritable_spec_is_refused(
         self, tmp_path, mock_pio, capsys
     ):
+        """A plain `pio run` still enforces lib_deps: a lock outside the declared range would
+        make PlatformIO install an in-range duplicate. Libraries never move without the edit."""
         ini = "[env:test]\nlib_deps =\n    acme/Foo @ <2.0\n"
         (tmp_path / "platformio.ini").write_text(ini)
         self._foo(mock_pio, wanted="1.0.0", latest="2.1.0", spec="acme/Foo @ <2.0")
         assert pio_lock.update(tmp_path, ["test"], beyond_range=True, lock_only=True) == 0
         assert (tmp_path / "platformio.ini").read_text() == ini
-        assert self._install(tmp_path, "--library", "acme/Foo @ ==2.1.0") in (
+        assert mock_pio.pio_commands() == []
+        assert mock_pio.captured_envs == []
+        assert "Foo: 2.1.0 is outside acme/Foo @ <2.0; edit the ini by hand" in (
+            capsys.readouterr().out
+        )
+
+    def test_update_lock_only_beyond_range_library_is_refused(self, tmp_path, mock_pio, capsys):
+        (tmp_path / "platformio.ini").write_text(self.INI)
+        self._foo(mock_pio, wanted="1.0.0", latest="2.0.0")
+        assert pio_lock.update(tmp_path, ["test"], beyond_range=True, lock_only=True) == 0
+        assert (tmp_path / "platformio.ini").read_text() == self.INI
+        assert mock_pio.pio_commands() == []
+        assert mock_pio.captured_envs == []
+        out = capsys.readouterr().out
+        assert "Foo: 2.0.0 is outside acme/Foo @ ^1.0.0; edit the ini (or drop --lock-only)" in out
+        assert "Foo: 1.0.0 -> 2.0.0" not in out
+
+    def test_update_lock_only_exact_library_pin_is_refused(self, tmp_path, mock_pio, capsys):
+        """An exact pin's range is that version: moving only the lock leaves lib_deps asking
+        for the old one."""
+        ini = "[env:test]\nlib_deps =\n    acme/Foo @ 1.0.0\n"
+        (tmp_path / "platformio.ini").write_text(ini)
+        self._foo(mock_pio, wanted="1.0.0", latest="1.3.0", spec="acme/Foo @ 1.0.0")
+        assert pio_lock.update(tmp_path, ["test"], lock_only=True) == 0
+        assert mock_pio.pio_commands() == []
+        assert "Foo: 1.3.0 is outside acme/Foo @ 1.0.0; edit the ini (or drop --lock-only)" in (
+            capsys.readouterr().out
+        )
+
+    def test_update_lock_only_tag_ref_is_refused(self, tmp_path, mock_pio, monkeypatch, capsys):
+        url = "https://github.com/o/r.git"
+        ini = f"[env:test]\nlib_deps =\n    {url}#v1.2.0\n"
+        (tmp_path / "platformio.ini").write_text(ini)
+        mock_pio.add_lib("test", f"{url}#v1.2.0", "r", f"1.2.0+sha.{LOCKED}", external=True)
+        github = FakeGitHubClient({"repos/o/r/tags?per_page=100": [{"name": "v1.3.0"}]})
+        monkeypatch.setattr(pio_lock, "_create_github_client_fn", lambda: github)
+        assert pio_lock.update(tmp_path, ["test"], lock_only=True) == 0
+        assert mock_pio.pio_commands() == []
+        assert f"r: v1.3.0 is outside {url}#v1.2.0; edit the ini (or drop --lock-only)" in (
+            capsys.readouterr().out
+        )
+
+    def test_update_lock_only_within_range_still_moves(self, tmp_path, mock_pio, capsys):
+        (tmp_path / "platformio.ini").write_text(self.INI)
+        self._foo(mock_pio, wanted="1.2.0", latest="2.0.0")
+        assert pio_lock.update(tmp_path, ["test"], beyond_range=True, lock_only=True) == 0
+        assert self._install(tmp_path, "--library", "acme/Foo @ ==1.2.0") in (
             mock_pio.pio_commands()
         )
-        assert mock_pio.captured_envs == [["test"]]
-        assert "edit the ini by hand" not in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "Foo: 1.0.0 -> 1.2.0" in out
+        assert "Foo: 2.0.0 is outside acme/Foo @ ^1.0.0; edit the ini (or drop --lock-only)" in out
+
+    # ── stale platform lock (platform = changed since capture) ──
+
+    LOCK_V2: ClassVar[dict[str, Any]] = {
+        "lockfile_version": 2,
+        "envs": {
+            "test": {
+                "platform": {
+                    "spec": "espressif32",
+                    "platform_packages_spec": [],
+                    "name": "espressif32",
+                    "version": "6.6.0",
+                    "src_url": None,
+                    "packages": [],
+                    "owner": "platformio",
+                },
+                "libraries": [],
+            }
+        },
+    }
+
+    def test_update_keeps_the_locked_platform_when_unchanged(self, tmp_path, mock_pio):
+        (tmp_path / "platformio.ini").write_text(
+            "[env:test]\nplatform = espressif32\nlib_deps =\n    acme/Foo @ ^1.0.0\n"
+        )
+        (tmp_path / "pio.lock.json").write_text(json.dumps(self.LOCK_V2))
+        self._foo(mock_pio)
+        assert pio_lock.update(tmp_path, ["test"]) == 0
+        assert mock_pio.capture_kwargs[-1]["platform_specs"] == {
+            "test": "platformio/espressif32@6.6.0"
+        }
+
+    def test_update_does_not_hide_a_stale_platform_lock(self, tmp_path, mock_pio):
+        """After `platform =` changed, a library update must not record the new spec resolved
+        to the old locked version: the platform is resolved normally (or kept, with a hint)."""
+        (tmp_path / "platformio.ini").write_text(
+            "[env:test]\nplatform = espressif32@^7\nlib_deps =\n    acme/Foo @ ^1.0.0\n"
+        )
+        (tmp_path / "pio.lock.json").write_text(json.dumps(self.LOCK_V2))
+        self._foo(mock_pio)
+        assert pio_lock.update(tmp_path, ["test"]) == 0
+        kwargs = mock_pio.capture_kwargs[-1]
+        assert "test" not in (kwargs["platform_specs"] or {})
+        assert kwargs["keep_uninstalled"] is True
 
 
 # ── Tests for ConfigSourceTracker ─────────────────────────────────────────────

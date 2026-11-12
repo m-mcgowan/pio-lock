@@ -1733,3 +1733,20 @@ def test_real_adapter_lists_installed_tools_once(monkeypatch: Any) -> None:
     assert adapter.package_installed({"name": "tool-b", "version": "2.0.0", "owner": "o"})
     assert not adapter.package_installed({"name": "tool-b", "version": "2.0.1", "owner": "o"})
     assert calls["n"] == 1
+
+
+def test_capture_keep_uninstalled_keeps_previous_platform_with_hint(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    """What update does for an env whose `platform =` changed and isn't installed."""
+    fake = fake_pio({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    (tmp_project / "platformio.ini").write_text("[env:testenv]\nplatform = espressif32@^7\n")
+    del fake.platforms["testenv"]
+    capsys.readouterr()
+    assert pio_lock.capture(tmp_project, ["testenv"], keep_uninstalled=True) == 0
+    platform = _read_lock(tmp_project)["envs"]["testenv"]["platform"]
+    assert (platform["spec"], platform["version"]) == ("espressif32", "6.6.0")
+    err = capsys.readouterr().err
+    assert "run: pio-lock capture --install -e testenv" in err
+    assert "keeping the previous lock" in err

@@ -3224,6 +3224,10 @@ class _UpdatePlan:
     def report_hand_edit(self, name: str, version: str, spec: str) -> None:
         self._report(f"{name}: {version} is outside {spec}; edit the ini by hand")
 
+    def report_lock_only(self, name: str, version: str, spec: str, rewritable: bool) -> None:
+        fix = "edit the ini (or drop --lock-only)" if rewritable else "edit the ini by hand"
+        self._report(f"{name}: {version} is outside {spec}; {fix}")
+
     def needs_hand_edit(
         self, beyond: bool, new_spec: Optional[str], name: str, target: str, spec: str
     ) -> bool:
@@ -3250,6 +3254,20 @@ def _plan_registry_library(
     target, outside, beyond = _pick_target(current, in_range, latest, plan.beyond_range)
     if outside:
         plan.report_outside(entry["name"], outside, spec_str)
+
+    def outside_spec(version: str, beyond_range: bool) -> bool:
+        if kind == "bare":
+            return False
+        return beyond_range or _requirement_allows(str(requirement), version) is False
+
+    if target and plan.lock_only and outside_spec(target, beyond):
+        # A plain `pio run` still enforces lib_deps: a lock outside it would make PlatformIO
+        # install a second, matching copy. Libraries never move without the ini edit.
+        rewritable = _build_updated_spec(spec_str, target) is not None
+        plan.report_lock_only(entry["name"], target, spec_str, rewritable)
+        target = in_range if _is_newer(in_range, current) else None
+        if target and outside_spec(target, False):
+            target = None
     if not target:
         return
     new_spec = _build_updated_spec(spec_str, target) if kind != "bare" else None
@@ -3317,6 +3335,10 @@ def _plan_git_library(
     if outside:
         plan.report_outside(name, outside, spec_str)
     if not target:
+        return
+    if plan.lock_only:
+        # The tag is an exact ref: lib_deps would still ask for the old one (see above).
+        plan.report_lock_only(name, target, spec_str, rewritable=True)
         return
     edit = None
     if not plan.lock_only:
@@ -3762,9 +3784,9 @@ def update(
     for note in notes:
         print(note)
 
-    platform_specs = _keep_platform_specs(project_dir, affected)
+    platform_specs = _keep_platform_specs(project_dir, affected, adapter)
     platform_specs.update({m.env: m.platform_spec for m in plan.moves if m.platform_spec})
-    rc = capture(project_dir, affected, platform_specs=platform_specs)
+    rc = capture(project_dir, affected, platform_specs=platform_specs, keep_uninstalled=True)
     if rc != 0:
         changed = ", ".join(dict.fromkeys(_display_path(e.path, project_dir) for e in applied))
         what = f"{changed} edited" if changed else "newer versions installed"
@@ -3779,16 +3801,37 @@ def update(
     return 0
 
 
-def _keep_platform_specs(project_dir: Path, envs: list[str]) -> dict[str, str]:
-    """Exact specs of the locked registry platforms of ``envs`` (re-captured unchanged)."""
+def _keep_platform_specs(
+    project_dir: Path, envs: list[str], adapter: PioAdapter
+) -> dict[str, str]:
+    """Exact specs of the locked registry platforms of ``envs`` to re-capture unchanged.
+
+    Only for envs whose lock is current: after the user changed ``platform =`` or
+    ``platform_packages``, keeping the old platform would record the new spec at the old
+    version and hide the stale lock. Those envs resolve normally (capture keeps the previous
+    platform, with a ``capture --install`` hint, if the new one isn't installed).
+    """
     lockfile_path = project_dir / LOCKFILE_NAME
     if not lockfile_path.exists():
         return {}
-    locked_envs = load_lockfile(lockfile_path).get("envs", {})
+    try:
+        locked_envs = load_lockfile(lockfile_path).get("envs", {})
+        config = adapter.user_config(project_dir)
+    except (OSError, ValueError, PioIncompatible):
+        return {}
     specs: dict[str, str] = {}
     for env in envs:
-        platform = locked_envs.get(env, {}).get("platform")
-        if platform and not platform.get("src_url"):
+        env_lock = locked_envs.get(env, {})
+        platform = env_lock.get("platform")
+        if not platform or platform.get("src_url"):
+            continue
+        section = f"env:{env}"
+        try:
+            spec = str(config.get(section, "platform", "") or "")
+            packages = [str(p) for p in config.get(section, "platform_packages", []) or []]
+        except (AttributeError, TypeError):
+            continue
+        if not env_lock_is_stale(env_lock, spec, packages):
             specs[env] = _platform_exact_spec(platform)
     return specs
 
