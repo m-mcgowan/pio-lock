@@ -814,8 +814,13 @@ def test_capture_upgrades_v1_lockfile(tmp_project: Path, fake_pio: Any) -> None:
 # ── check / restore of the platform ─────────────────────────────────────────
 
 
+_INCLUDE = "[platformio]\nextra_configs = pio.lock.ini\n"
+
+
 def _locked_project(project: Path, fake_pio: Any, lock: PlatformLock) -> None:
-    """Capture ``lock`` for ``testenv`` (so the lockfile is v2), then reinstall the fake."""
+    """Capture ``lock`` for ``testenv`` (so the lockfile is v2) with pio.lock.ini included."""
+    ini = project / "platformio.ini"
+    ini.write_text(_INCLUDE + ini.read_text())
     fake_pio({"testenv": lock})
     assert pio_lock.capture(project, ["testenv"]) == 0
 
@@ -839,7 +844,9 @@ def test_check_reports_platform_version_drift(
 
 def test_check_reports_stale_platform_spec(tmp_project: Path, fake_pio: Any, capsys: Any) -> None:
     _locked_project(tmp_project, fake_pio, _lock())
-    (tmp_project / "platformio.ini").write_text("[env:testenv]\nplatform = espressif32@^7\n")
+    (tmp_project / "platformio.ini").write_text(
+        _INCLUDE + "[env:testenv]\nplatform = espressif32@^7\n"
+    )
     assert pio_lock.check(tmp_project, ["testenv"]) == 1
     out = capsys.readouterr().out
     assert "platform spec changed: 'espressif32' → 'espressif32@^7'; run capture --install" in out
@@ -850,7 +857,7 @@ def test_check_reports_stale_platform_packages(
 ) -> None:
     _locked_project(tmp_project, fake_pio, _lock())
     (tmp_project / "platformio.ini").write_text(
-        "[env:testenv]\nplatform = espressif32\nplatform_packages =\n  tool-foo@1.2.3\n"
+        _INCLUDE + "[env:testenv]\nplatform = espressif32\nplatform_packages =\n  tool-foo@1.2.3\n"
     )
     assert pio_lock.check(tmp_project, ["testenv"]) == 1
     out = capsys.readouterr().out
@@ -1071,6 +1078,7 @@ def test_real_adapter_package_installed_matches_exact_version(monkeypatch: Any) 
     monkeypatch.setattr(
         _StubToolPackageManager, "installed", [_tool("tool-a", "1.0.1"), _tool("tool-a", "1.0.0")]
     )
+    adapter = _StubAdapter(_stub_modules())  # a new adapter: the installed list is cached
     assert adapter.package_installed({"name": "tool-a", "version": "1.0.0", "owner": "o"})
     # file:// packages have no exact spec: matched by name and version.
     assert adapter.package_installed(
@@ -1096,6 +1104,7 @@ def test_check_config_error_is_clean_error(
         raise pio_lock.ProjectConfigError("invalid PlatformIO project configuration in x")
 
     monkeypatch.setattr(adapter, "user_config", broken)
+    monkeypatch.setattr(adapter, "config_files", broken)
     assert pio_lock.check(tmp_project, ["testenv"]) == 1
     assert "Error: invalid PlatformIO project configuration" in capsys.readouterr().err
 
@@ -1631,3 +1640,96 @@ def test_update_platform_install_failure_reports_and_keeps_lock(
     assert "Error: could not install espressif32: offline" in err
     assert "were NOT changed" in err
     assert _read_lock(tmp_project)["envs"]["testenv"]["platform"]["version"] == "6.6.0"
+
+
+# ── Robustness: unreadable lockfile, include missing, probing once ───────────
+
+
+_CONFLICTED = '{\n<<<<<<< HEAD\n  "lockfile_version": 2,\n=======\n  "lockfile_version": 1,\n'
+
+
+def test_capture_replaces_an_unreadable_lockfile(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    fake_pio({"testenv": _lock()})
+    (tmp_project / "pio.lock.json").write_text(_CONFLICTED)
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    assert _read_lock(tmp_project)["envs"]["testenv"]["platform"]["version"] == "6.6.0"
+    err = capsys.readouterr().err
+    assert "pio.lock.json is unreadable (" in err
+    assert "); previous entries are not kept" in err
+
+
+@pytest.mark.parametrize("command", ["check", "restore"])
+def test_check_and_restore_report_an_unreadable_lockfile(
+    tmp_project: Path, fake_pio: Any, capsys: Any, command: str
+) -> None:
+    fake_pio({"testenv": _lock()})
+    (tmp_project / "pio.lock.json").write_text(_CONFLICTED)
+    assert getattr(pio_lock, command)(tmp_project, ["testenv"]) == 1
+    assert "Error: pio.lock.json is unreadable: " in capsys.readouterr().err
+
+
+def test_check_without_include_hints_and_skips_platform(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    """Like the build hook: without pio.lock.ini included the platform isn't pinned, so a
+    different platform in use is not drift."""
+    _locked_project(tmp_project, fake_pio, _lock(version="6.6.0"))
+    (tmp_project / "platformio.ini").write_text(
+        "[env:testenv]\nplatform = espressif32\nboard = esp32dev\n"
+    )
+    fake_pio({"testenv": _lock()}, in_use={"testenv": ("espressif32", "6.7.0")})
+    assert pio_lock.check(tmp_project, ["testenv"]) == 0
+    out = capsys.readouterr().out
+    assert "DRIFT" not in out and "6.7.0" not in out
+    assert (
+        "  platform not compared: pio.lock.ini is not included; add 'extra_configs = "
+        "pio.lock.ini' (or run pio-lock init) to pin the platform"
+    ) in out
+
+
+def test_commands_probe_pio_once(
+    tmp_project: Path, fake_pio: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_project / "platformio.ini").write_text(
+        "[platformio]\nextra_configs = pio.lock.ini\n[env:a]\nplatform = espressif32\n"
+        "[env:b]\nplatform = espressif32\n"
+    )
+    fake = fake_pio({"a": _lock(), "b": _lock()})
+    monkeypatch.setattr(pio_lock, "_create_github_client_fn", lambda: None)
+    monkeypatch.setattr(pio_lock, "_pio_import_fn", lambda: (None, None, None))
+    for command in ("capture", "check", "restore", "outdated", "update"):
+        fake.probes = 0
+        getattr(pio_lock, command)(tmp_project, ["a", "b"])
+        assert fake.probes == 1, command
+
+
+def test_capture_incompatible_core_is_reported_once(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    (tmp_project / "platformio.ini").write_text(
+        "[env:a]\nplatform = espressif32\n[env:b]\nplatform = espressif32\n"
+    )
+    fake_pio({}, incompatible="platformio.platform.factory.PlatformFactory")
+    assert pio_lock.capture(tmp_project, ["a", "b"]) == 0
+    err = capsys.readouterr().err
+    assert err.count("is not compatible with pio-lock") == 1
+
+
+def test_real_adapter_lists_installed_tools_once(monkeypatch: Any) -> None:
+    calls = {"n": 0}
+
+    class _Tools(_StubToolPackageManager):
+        def get_installed(self) -> list[Any]:
+            calls["n"] += 1
+            return [_tool("tool-a", "1.0.0"), _tool("tool-b", "2.0.0")]
+
+    modules = _stub_modules(
+        **{"platformio.package.manager.tool": SimpleNamespace(ToolPackageManager=_Tools)}
+    )
+    adapter = _StubAdapter(modules)
+    assert adapter.package_installed({"name": "tool-a", "version": "1.0.0", "owner": "o"})
+    assert adapter.package_installed({"name": "tool-b", "version": "2.0.0", "owner": "o"})
+    assert not adapter.package_installed({"name": "tool-b", "version": "2.0.1", "owner": "o"})
+    assert calls["n"] == 1

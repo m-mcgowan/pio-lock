@@ -605,10 +605,33 @@ def is_installed_at_locked_version(
 
 
 def load_lockfile(path: Path) -> dict[str, Any]:
-    """Read a lockfile; files written before format v2 get ``lockfile_version: 1``."""
-    data: dict[str, Any] = json.loads(Path(path).read_text())
+    """Read a lockfile; files written before format v2 get ``lockfile_version: 1``.
+
+    Raises OSError, or ValueError when the file isn't a lockfile (bad JSON, a merge conflict).
+    """
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict) or not isinstance(data.get("envs", {}), dict):
+        raise ValueError("not a pio-lock lockfile")
     data.setdefault("lockfile_version", 1)
     return data
+
+
+def _read_lockfile_or_report(path: Path) -> Optional[dict[str, Any]]:
+    """The lockfile, or None after printing why it can't be read (for check and restore)."""
+    try:
+        return load_lockfile(path)
+    except (OSError, ValueError) as exc:
+        print(f"Error: {LOCKFILE_NAME} is unreadable: {exc}", file=sys.stderr)
+        return None
+
+
+def _probe(adapter: PioAdapter) -> Optional[PioIncompatible]:
+    """``adapter.probe()``: None when PlatformIO is compatible, else the problem."""
+    try:
+        adapter.probe()
+    except PioIncompatible as exc:
+        return exc
+    return None
 
 
 _GIT_SHA_SUFFIX_RE = re.compile(r"\+sha\.([0-9a-f]+)$")
@@ -1085,6 +1108,9 @@ def capture(
         return 1
 
     adapter = _pio_adapter_factory()
+    incompatible = _probe(adapter)
+    if incompatible is not None:
+        print(f"  Warning: {incompatible}", file=sys.stderr)
     try:
         config: Any = adapter.user_config(project_dir)
         configured: Optional[set[str]] = set(config.envs())
@@ -1106,13 +1132,35 @@ def capture(
 
     print(f"Capturing dependency state for: {', '.join(envs)}")
     dest = output_path or (project_dir / LOCKFILE_NAME)
-    previous = load_lockfile(dest).get("envs", {}) if dest.exists() else {}
+    previous: dict[str, Any] = {}
+    if dest.exists():
+        try:
+            previous = load_lockfile(dest).get("envs", {})
+        except (OSError, ValueError) as exc:
+            print(
+                f"  Warning: {LOCKFILE_NAME} is unreadable ({exc}); previous entries are not kept",
+                file=sys.stderr,
+            )
+
+    def keep_previous_platform(env_name: str, env_lock: dict[str, Any], why: str) -> None:
+        previous_platform = previous.get(env_name, {}).get("platform")
+        if previous_platform:
+            env_lock["platform"] = previous_platform
+            print(
+                f"  Warning: platform for env '{env_name}' not re-captured ({why}); "
+                "keeping the previous lock",
+                file=sys.stderr,
+            )
+        else:
+            print(f"  Warning: platform not locked for {env_name}", file=sys.stderr)
 
     captured: dict[str, dict[str, Any]] = {}
     for env_name in envs:
         print(f"  Scanning {env_name}...")
         env_lock: dict[str, Any] = {}
         try:
+            if incompatible is not None:
+                raise incompatible
             installed_spec = (platform_specs or {}).get(env_name)
             kwargs = {"installed_spec": installed_spec} if installed_spec else {}
             try:
@@ -1126,30 +1174,15 @@ def capture(
             env_lock["platform"] = asdict(resolved)
             print(f"    Platform {env_lock['platform']['name']} {env_lock['platform']['version']}")
         except PioIncompatible as exc:
-            print(f"  Warning: {exc}", file=sys.stderr)
-            previous_platform = previous.get(env_name, {}).get("platform")
-            if previous_platform:
-                env_lock["platform"] = previous_platform
-                print(
-                    f"  Warning: platform for env '{env_name}' not re-captured "
-                    "(PlatformIO incompatible); keeping the previous lock",
-                    file=sys.stderr,
-                )
-            else:
-                print(f"  Warning: platform not locked for {env_name}", file=sys.stderr)
+            if exc is not incompatible:  # the probe's failure was reported once, above
+                print(f"  Warning: {exc}", file=sys.stderr)
+            keep_previous_platform(env_name, env_lock, "PlatformIO incompatible")
         except PlatformNotInstalled as exc:
-            previous_platform = previous.get(env_name, {}).get("platform")
             if not keep_uninstalled:
                 print(f"Error: {exc}", file=sys.stderr)
                 return 1
             print(f"  Warning: {exc}", file=sys.stderr)
-            if previous_platform:
-                env_lock["platform"] = previous_platform
-                print(
-                    f"  Warning: platform for env '{env_name}' not re-captured; "
-                    "keeping the previous lock",
-                    file=sys.stderr,
-                )
+            keep_previous_platform(env_name, env_lock, "not installed")
         except (PlatformInstallError, ValueError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
@@ -1230,7 +1263,15 @@ def restore(project_dir: Path, envs: list[str]) -> int:
         print(f"Error: no {LOCKFILE_NAME} in {project_dir}", file=sys.stderr)
         return 1
 
-    lockdata = load_lockfile(lockfile_path)
+    lockdata = _read_lockfile_or_report(lockfile_path)
+    if lockdata is None:
+        return 1
+    incompatible = _probe(_pio_adapter_factory())
+    if incompatible is not None:
+        print(
+            f"  Warning: {incompatible} (restore installs with the pio CLI and carries on)",
+            file=sys.stderr,
+        )
 
     for env_name in envs:
         if env_name not in lockdata.get("envs", {}):
@@ -1340,6 +1381,9 @@ def platform_drift(
 
 
 _ALLOW_OVERRIDE_ENV_VAR = "PIO_LOCK_ALLOW_OVERRIDE"
+_INCLUDE_ADVICE = (
+    f"add 'extra_configs = {LOCK_INI_NAME}' (or run pio-lock init) to pin the platform"
+)
 _LOCKED_OPTIONS = ("platform", "platform_packages")
 
 
@@ -1407,11 +1451,15 @@ def check(project_dir: Path, envs: list[str], warn_only: bool = False) -> int:
         print(f"Error: no {LOCKFILE_NAME} in {project_dir}", file=sys.stderr)
         return 1
 
-    lockdata = load_lockfile(lockfile_path)
+    lockdata = _read_lockfile_or_report(lockfile_path)
+    if lockdata is None:
+        return 1
     warn = warn_only or _drift_policy_from_env() == "warn"
     label = "WARNING" if warn else "DRIFT"
     problems_found = False
     adapter: Optional[PioAdapter] = None
+    incompatible: Optional[PioIncompatible] = None  # from probing PlatformIO once
+    incompatible_reported = False
     platform_checked = False
 
     if lockdata["lockfile_version"] < 2:
@@ -1431,30 +1479,47 @@ def check(project_dir: Path, envs: list[str], warn_only: bool = False) -> int:
                     f"  platform not checked: env '{env_name}' has no locked platform; run capture"
                 )
             else:
+                if adapter is None:
+                    adapter = _pio_adapter_factory()
+                    incompatible = _probe(adapter)
                 try:
-                    if adapter is None:
-                        adapter = _pio_adapter_factory()
-                    drift = platform_drift(project_dir, env_name, env_lock, adapter)
-                    platform_checked = True
-                    for problem in drift:
-                        problems_found = True
-                        print(f"  {label}: {problem}")
-                    allow_override = bool(_allow_override_from_env())
-                    for override in lock_overrides(project_dir, env_name, adapter):
-                        if allow_override:
-                            print(f"  WARNING: {override} (allowed by {_ALLOW_OVERRIDE_ENV_VAR})")
-                        else:
+                    if incompatible is not None:
+                        raise incompatible
+                    if _lock_ini_position(project_dir, adapter.config_files(project_dir)) is None:
+                        # Like the build hook: without the include the platform isn't pinned,
+                        # so it isn't compared.
+                        print(
+                            f"  platform not compared: {LOCK_INI_NAME} is not included; "
+                            f"{_INCLUDE_ADVICE}"
+                        )
+                    else:
+                        drift = platform_drift(project_dir, env_name, env_lock, adapter)
+                        platform_checked = True
+                        for problem in drift:
                             problems_found = True
-                            print(
-                                f"  {label}: {override}; move {LOCK_INI_NAME} last in "
-                                f"extra_configs, or set {_ALLOW_OVERRIDE_ENV_VAR}=1"
-                            )
+                            print(f"  {label}: {problem}")
+                        allow_override = bool(_allow_override_from_env())
+                        for override in lock_overrides(project_dir, env_name, adapter):
+                            if allow_override:
+                                print(
+                                    f"  WARNING: {override} (allowed by {_ALLOW_OVERRIDE_ENV_VAR})"
+                                )
+                            else:
+                                problems_found = True
+                                print(
+                                    f"  {label}: {override}; move {LOCK_INI_NAME} last in "
+                                    f"extra_configs, or set {_ALLOW_OVERRIDE_ENV_VAR}=1"
+                                )
                 except ValueError as exc:  # includes ProjectConfigError
                     print(f"Error: {exc}", file=sys.stderr)
                     return 1
                 except PioIncompatible as exc:
                     # Not drift: the platform can't be inspected. Libraries are still checked.
-                    print(f"  WARNING: platform not checked: {exc}")
+                    if exc is incompatible and incompatible_reported:
+                        print("  WARNING: platform not checked (PlatformIO incompatible, above)")
+                    else:
+                        print(f"  WARNING: platform not checked: {exc}")
+                        incompatible_reported = exc is incompatible
 
         duplicates, drifted = library_findings(project_dir, env_name, env_lock)
         for duplicate in duplicates:
@@ -1884,6 +1949,7 @@ class PioAdapter:
 
         Looks for the exact spec first, then matches by name and exact version among the
         installed tool packages (which also covers packages with no exact spec, e.g. file://).
+        The installed list is read once per adapter (``install_platform`` resets it).
         """
         manager_cls = self._lookup("platformio.package.manager.tool", "ToolPackageManager")
         name, version = str(package["name"]), str(package["version"])
@@ -1896,10 +1962,15 @@ class PioAdapter:
                 found = manager.get_package(spec) if spec else None
                 if found is not None and str(found.metadata.version) == version:
                     return True
-            return any(
-                str(pkg.metadata.name) == name and str(pkg.metadata.version) == version
-                for pkg in manager.get_installed()
-            )
+            # Listing every installed tool reads each package's manifest: once per adapter.
+            cache = self.__dict__.setdefault("_installed_tools", {})
+            key = str(project_dir or "")
+            if key not in cache:
+                cache[key] = [
+                    (str(pkg.metadata.name), str(pkg.metadata.version))
+                    for pkg in manager.get_installed()
+                ]
+            return (name, version) in cache[key]
 
     def latest_platform_version(self, name: str, owner: Optional[str] = None) -> Optional[str]:
         """Newest registry version of a platform, or None if the registry can't be reached."""
@@ -2526,20 +2597,43 @@ def _check_registry_platform(
 # ── Outdated / update helpers ────────────────────────────────────────────────
 
 
+def _library_setup(project_dir: Path) -> Optional[tuple[PioAdapter, Any, bool]]:
+    """(adapter, the user's config view, platforms can be checked) for outdated/update.
+
+    Probes PlatformIO once: when incompatible, a warning says platforms aren't checked.
+    None after printing why the project config can't be read.
+    """
+    _pio_import_fn()  # without PlatformIO: a clear message, and exit
+    adapter = _pio_adapter_factory()
+    incompatible = _probe(adapter)
+    if incompatible is not None:
+        print(f"Warning: {incompatible}; platforms are not checked", file=sys.stderr)
+    try:
+        config = adapter.user_config(project_dir)
+    except (PioIncompatible, ProjectConfigError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return None
+    return adapter, config, incompatible is None
+
+
 def _get_outdated_entries(
     project_dir: Path,
     envs: list[str],
+    config: Any,
     lib_filter: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Check all deps across envs for available updates using PIO's API."""
-    lib_pkg_mgr_cls, pkg_spec_cls, proj_config_cls = _pio_import_fn()
+    """Check all deps across envs for available updates using PIO's API.
 
-    config = proj_config_cls.get_instance(str(project_dir / "platformio.ini"))
+    ``config`` is the user's view (``PioAdapter.user_config``): CWD-independent, no pio.lock.ini.
+    """
+    lib_pkg_mgr_cls, pkg_spec_cls, _project_config = _pio_import_fn()
     entries: list[dict[str, Any]] = []
+    libdeps_dir = config.get("platformio", "libdeps_dir", None)
 
     for env_name in envs:
         lib_deps = config.get(f"env:{env_name}", "lib_deps", [])
-        libdeps_dir = config.get(f"env:{env_name}", "libdeps_dir", None)
+        if not lib_deps:
+            continue
         if libdeps_dir:
             pkg_dir = Path(libdeps_dir) / env_name
         else:
@@ -2672,7 +2766,11 @@ def outdated(
         print(f"Error: no platformio.ini in {project_dir}", file=sys.stderr)
         return 1
 
-    entries = _get_outdated_entries(project_dir, envs)
+    setup = _library_setup(project_dir)
+    if setup is None:
+        return 1
+    _adapter, config, platforms_checkable = setup
+    entries = _get_outdated_entries(project_dir, envs, config)
 
     git_entries = _git_check_entries(project_dir, envs, entries)
 
@@ -2691,7 +2789,9 @@ def outdated(
             "Set GITHUB_TOKEN or install gh for git dependency update detection."
         )
 
-    registry_platform_results = _registry_platform_results(project_dir, envs)
+    registry_platform_results = (
+        _registry_platform_results(project_dir, envs) if platforms_checkable else []
+    )
 
     has_outdated = any(e["is_outdated"] for e in entries)
     has_registry_platform_outdated = any(
@@ -2809,8 +2909,16 @@ class ConfigSourceTracker:
     (list of file paths that were read, in order).
     """
 
-    def __init__(self, config: Any, fallback_path: Optional[Path] = None):
-        self._files: list[str] = getattr(config, "_parsed", [])
+    def __init__(
+        self,
+        config: Any = None,
+        fallback_path: Optional[Path] = None,
+        files: Optional[list[Path]] = None,
+    ):
+        """``files`` (in read order) instead of ``config._parsed``."""
+        self._files: list[str] = (
+            [str(f) for f in files] if files is not None else getattr(config, "_parsed", [])
+        )
         if not self._files and fallback_path:
             self._files = [str(fallback_path)]
         # (section, option) -> filepath — last writer wins (matches configparser)
@@ -3576,12 +3684,19 @@ def update(
         print(f"Error: no platformio.ini in {project_dir}", file=sys.stderr)
         return 1
 
-    _pm_cls, _spec_cls, proj_config_cls = _pio_import_fn()
-    config = proj_config_cls.get_instance(str(project_dir / "platformio.ini"))
-    tracker = ConfigSourceTracker(config, fallback_path=project_dir / "platformio.ini")
+    setup = _library_setup(project_dir)
+    if setup is None:
+        return 1
+    adapter, config, platforms_checkable = setup
+    try:
+        files = _user_config_files(adapter, project_dir)
+    except (PioIncompatible, ProjectConfigError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    tracker = ConfigSourceTracker(files=files)
 
     plan = _UpdatePlan(project_dir, lock_only=lock_only, beyond_range=beyond_range)
-    entries = _get_outdated_entries(project_dir, envs, lib_filter=lib_filter)
+    entries = _get_outdated_entries(project_dir, envs, config, lib_filter=lib_filter)
     for entry in entries:
         if entry["type"] == "registry" and not entry["detached"]:
             _plan_registry_library(plan, entry, tracker)
@@ -3597,7 +3712,7 @@ def update(
             _plan_git_library(plan, entry, tracker, github)
     elif git_entries:
         plan.unchecked.append("git dependencies")
-    if not lib_filter:
+    if not lib_filter and platforms_checkable:
         _plan_platforms(plan, envs, github)
 
     for what in plan.unchecked:
@@ -3743,9 +3858,7 @@ def _already_loaded(env: Any) -> bool:
 _DRIFT_INI_OPTION = "custom_pio_lock_drift"
 _ALLOW_OVERRIDE_INI_OPTION = "custom_pio_lock_allow_override"
 _DRIFT_PROMPT = "Continue with this build? [c]ontinue / [a]bort:"
-_INCLUDE_HINT = (
-    f"pio-lock: add 'extra_configs = {LOCK_INI_NAME}' (or run pio-lock init) to pin the platform"
-)
+_INCLUDE_HINT = f"pio-lock: {_INCLUDE_ADVICE}"
 
 
 def _project_option(env: Any, name: str) -> str:
@@ -3878,6 +3991,7 @@ def _collect_build_findings(
         )
     else:
         try:
+            adapter.probe()  # an incompatible Core is reported once, by its first missing part
             _platform_build_findings(
                 project_dir, env_name, env_lock, adapter, _allow_override(env), findings
             )

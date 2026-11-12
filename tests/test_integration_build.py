@@ -261,7 +261,7 @@ def test_resolve_platform_ignores_lock_ini(tmp_path: Path) -> None:
     assert out["resolve_platform"]["packages"] == []
     assert out["platform_in_use"] == {
         "not_installed": "platform for env 'native' is not installed; "
-        "run: pio pkg install -e native"
+        "run: pio-lock capture --install -e native"
     }
 
 
@@ -271,7 +271,7 @@ def test_resolve_platform_package_not_installed(tmp_path: Path) -> None:
     p = _native_installed_project(tmp_path, "[env:native]\nplatform = native\n")
     (p / "platformio.ini").write_text(ini)
     out = run_in_pio_python(_RESOLVE_CODE, str(p), "native", cwd=tmp_path)
-    assert "pio pkg install -e native" in out["resolve_platform"]["not_installed"]
+    assert "pio-lock capture --install -e native" in out["resolve_platform"]["not_installed"]
 
 
 _PROJECT_DIR_CODE = """\
@@ -484,7 +484,8 @@ def test_capture_platform_inherited_from_env_section_real_pio(tmp_path: Path) ->
 
 @requires_pio
 def test_check_warn_only_on_real_project(tmp_path: Path) -> None:
-    p = make_native_project(tmp_path, "[env:native]\nplatform = native\n")
+    include = "[platformio]\nextra_configs = pio.lock.ini\n"
+    p = make_native_project(tmp_path, include + "[env:native]\nplatform = native\n")
     cli = [sys.executable, str(REPO_ROOT / "pio_lock.py"), "-d", str(p)]
 
     def run(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -502,7 +503,7 @@ def test_check_warn_only_on_real_project(tmp_path: Path) -> None:
     ok = run("check", "-e", "native")
     assert ok.returncode == 0, ok.stdout
 
-    (p / "platformio.ini").write_text("[env:native]\nplatform = native@*\n")
+    (p / "platformio.ini").write_text(include + "[env:native]\nplatform = native@*\n")
     failed = run("check", "-e", "native")
     assert failed.returncode == 1, failed.stdout
     assert "DRIFT:" in failed.stdout

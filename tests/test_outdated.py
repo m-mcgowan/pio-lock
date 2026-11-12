@@ -131,8 +131,11 @@ def mock_pio(monkeypatch, tmp_path, mock_git_commands):
     captured: list[list[str]] = []
     capture_rc = {"rc": 0}
 
-    def fake_capture(project_dir, envs, output_path=None, platform_specs=None):
+    capture_kwargs: list[dict[str, Any]] = []
+
+    def fake_capture(project_dir, envs, output_path=None, **kwargs):
         captured.append(list(envs))
+        capture_kwargs.append(kwargs)
         return capture_rc["rc"]
 
     monkeypatch.setattr(pio_lock, "capture", fake_capture)
@@ -141,6 +144,23 @@ def mock_pio(monkeypatch, tmp_path, mock_git_commands):
     packages: dict[str, FakePackageItem] = {}
     outdated_results: dict[str, FakeOutdatedResult] = {}
     lib_deps: dict[str, list[str]] = {}
+
+    class _LibDepsView:
+        """The project's config view, with the env lib_deps registered by ``add_lib``."""
+
+        def __init__(self, view: Any) -> None:
+            self._view = view
+
+        def get(self, section: str, option: str, *default: Any) -> Any:
+            if option == "lib_deps" and section[4:] in lib_deps:
+                return list(lib_deps[section[4:]])
+            return self._view.get(section, option, *default)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._view, name)
+
+    real_user_config = adapter.user_config
+    monkeypatch.setattr(adapter, "user_config", lambda p: _LibDepsView(real_user_config(p)))
 
     fake_pm = MagicMock()
     fake_pm.get_package = lambda spec: packages.get(spec.name)
@@ -173,6 +193,7 @@ def mock_pio(monkeypatch, tmp_path, mock_git_commands):
     class Builder:
         run_log = mock_git_commands
         captured_envs = captured
+        capture_kwargs: list[dict[str, Any]]
 
         def fail_capture(self) -> None:
             capture_rc["rc"] = 1
@@ -212,7 +233,9 @@ def mock_pio(monkeypatch, tmp_path, mock_git_commands):
                     version, latest=latest, wanted=wanted, detached=detached
                 )
 
-    return Builder()
+    builder = Builder()
+    builder.capture_kwargs = capture_kwargs
+    return builder
 
 
 # ── Tests for outdated ───────────────────────────────────────────────────────
