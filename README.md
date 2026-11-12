@@ -521,6 +521,8 @@ Format v1 (0.3.x and earlier) had top-level `platform_url` and `global_packages`
 
 ## Contributing
 
+For how pio-lock is put together and why, see [docs/architecture.md](docs/architecture.md).
+
 ### Developer setup
 
 ```bash
