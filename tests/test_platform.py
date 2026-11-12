@@ -45,6 +45,9 @@ class _StubPlatformPackageManager:
     def get_package(self, spec: str) -> Any:
         return self.installed.get(spec)
 
+    def install(self, spec: Any, skip_dependencies: bool = False, **kwargs: Any) -> Any:
+        raise NotImplementedError
+
     def fetch_registry_package(self, spec: Any) -> Any:
         if isinstance(self.registry, Exception):
             raise self.registry
@@ -72,6 +75,9 @@ class _StubPlatformBase:
 
     def get_package(self, name: str) -> Any:
         return None
+
+    def install_required_packages(self, force: bool = False) -> None:
+        pass
 
 
 def _stub_modules(**overrides: Any) -> dict[str, Any]:
@@ -172,7 +178,7 @@ def test_exception_messages() -> None:
     missing = PlatformNotInstalled("esp32")
     assert missing.env == "esp32"
     assert str(missing) == (
-        "platform for env 'esp32' is not installed; run: pio pkg install -e esp32"
+        "platform for env 'esp32' is not installed; run: pio-lock capture --install -e esp32"
     )
 
 
@@ -183,7 +189,7 @@ def test_resolve_platform_not_installed(tmp_project: Path) -> None:
     adapter = FakePioAdapter(platforms={})
     with pytest.raises(PlatformNotInstalled) as exc_info:
         adapter.resolve_platform(tmp_project, "testenv")
-    assert "pio pkg install -e testenv" in str(exc_info.value)
+    assert "pio-lock capture --install -e testenv" in str(exc_info.value)
 
 
 def test_real_adapter_raises_not_installed_when_package_missing(tmp_path: Path) -> None:
@@ -655,7 +661,7 @@ def test_capture_platform_not_installed_fails(
     assert not (tmp_project / "pio.lock.json").exists()
     assert not (tmp_project / "pio.lock.ini").exists()
     out = capsys.readouterr()
-    assert "pio pkg install -e testenv" in out.out + out.err
+    assert "pio-lock capture --install -e testenv" in out.out + out.err
 
 
 def test_load_lockfile_defaults_v1(tmp_path: Path) -> None:
@@ -836,7 +842,7 @@ def test_check_reports_stale_platform_spec(tmp_project: Path, fake_pio: Any, cap
     (tmp_project / "platformio.ini").write_text("[env:testenv]\nplatform = espressif32@^7\n")
     assert pio_lock.check(tmp_project, ["testenv"]) == 1
     out = capsys.readouterr().out
-    assert "platform spec changed: 'espressif32' → 'espressif32@^7'; run capture" in out
+    assert "platform spec changed: 'espressif32' → 'espressif32@^7'; run capture --install" in out
 
 
 def test_check_reports_stale_platform_packages(
@@ -851,7 +857,7 @@ def test_check_reports_stale_platform_packages(
     assert "DRIFT:" in out
     assert "platform_packages changed" in out
     assert "tool-foo@1.2.3" in out
-    assert "run capture" in out
+    assert "run capture --install" in out
 
 
 def test_check_reports_package_drift(tmp_project: Path, fake_pio: Any, capsys: Any) -> None:
@@ -1179,21 +1185,6 @@ def platform_update(monkeypatch: pytest.MonkeyPatch, mock_git_commands: Any, fak
     return fake_pio, pio_commands
 
 
-def _platform_install(project: Path, env: str, spec: str) -> list[str]:
-    return [
-        "pio",
-        "pkg",
-        "install",
-        "-d",
-        str(project),
-        "-e",
-        env,
-        "--platform",
-        spec,
-        "--no-save",
-    ]
-
-
 def _move_to(fake: FakePioAdapter, version: str) -> None:
     """The registry offers ``version``; installing it makes it resolvable."""
     fake.latest_versions = {"espressif32": version}
@@ -1203,7 +1194,7 @@ def _move_to(fake: FakePioAdapter, version: str) -> None:
 def test_update_bare_platform_changes_lock_only(
     tmp_project: Path, platform_update: Any, capsys: Any
 ) -> None:
-    install, pio_commands = platform_update
+    install, _ = platform_update
     ini = (tmp_project / "platformio.ini").read_text()
     fake = install({"testenv": dataclasses_replace(_lock(), owner="platformio")})
     assert pio_lock.capture(tmp_project, ["testenv"]) == 0
@@ -1216,9 +1207,7 @@ def test_update_bare_platform_changes_lock_only(
     assert platform["version"] == "6.7.0"
     assert platform["spec"] == "espressif32"
     assert "platformio/espressif32@6.7.0" in (tmp_project / "pio.lock.ini").read_text()
-    assert _platform_install(tmp_project, "testenv", "platformio/espressif32@6.7.0") in (
-        pio_commands()
-    )
+    assert fake.installed_calls == [("testenv", "platformio/espressif32@6.7.0")]
     out = capsys.readouterr().out
     assert "espressif32: 6.6.0 -> 6.7.0" in out
     assert "edited" not in out
@@ -1303,7 +1292,7 @@ def test_update_platform_in_range(tmp_project: Path, platform_update: Any) -> No
 def test_update_edits_platform_in_shared_env_section(
     tmp_project: Path, platform_update: Any, capsys: Any
 ) -> None:
-    install, pio_commands = platform_update
+    install, _ = platform_update
     (tmp_project / "platformio.ini").write_text(
         "[env]\nplatform = espressif32@6.6.0\n\n[env:a]\nboard = x\n\n[env:b]\nboard = y\n"
     )
@@ -1321,8 +1310,7 @@ def test_update_edits_platform_in_shared_env_section(
     assert envs["b"]["platform"]["version"] == "6.7.0"
     out = capsys.readouterr().out
     assert out.count("edited platformio.ini: espressif32@6.6.0 => espressif32@6.7.0") == 1
-    installs = [c for c in pio_commands() if "--platform" in c]
-    assert len(installs) == 1
+    assert fake.installed_calls == [("a", "platformio/espressif32@6.7.0")]
 
 
 def test_update_dry_run_platform_writes_nothing(
@@ -1346,7 +1334,7 @@ RELEASE = "https://github.com/pioarduino/platform-espressif32/releases/download/
 def test_update_release_url_platform_edits_ini(
     tmp_project: Path, platform_update: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
 ) -> None:
-    install, pio_commands = platform_update
+    install, _ = platform_update
     old, new = RELEASE.format(v="54.03.20"), RELEASE.format(v="54.03.21")
     (tmp_project / "platformio.ini").write_text(f"[env:testenv]\nplatform = {old}\n")
     fake = install({"testenv": _lock(version="54.3.20", src_url=old)})
@@ -1364,7 +1352,7 @@ def test_update_release_url_platform_edits_ini(
     assert pio_lock.update(tmp_project, ["testenv"]) == 0
     assert (tmp_project / "platformio.ini").read_text() == f"[env:testenv]\nplatform = {new}\n"
     assert _read_lock(tmp_project)["envs"]["testenv"]["platform"]["src_url"] == new
-    assert _platform_install(tmp_project, "testenv", new) in pio_commands()
+    assert fake.installed_calls == [("testenv", new)]
     out = capsys.readouterr().out
     assert "platform-espressif32: 54.03.20 -> 54.03.21" in out
     assert "55.03.30 is outside" in out
@@ -1470,3 +1458,176 @@ def test_update_release_url_without_github_notes_it(
     assert pio_lock.update(tmp_project, ["testenv"]) == 0
     assert pio_commands() == []
     assert "GITHUB_TOKEN" in capsys.readouterr().err
+
+
+# ── Installing a changed platform (capture --install) ────────────────────────
+
+
+class _RecordingPlatform:
+    """A platform object as PlatformFactory.new returns it, recording what is done to it."""
+
+    def __init__(self) -> None:
+        self.config: Any = "global ProjectConfig.get_instance()"
+        self.project_env: Any = None
+        self.configured: list[tuple[str, Any]] = []
+        self.required_installed_with: Any = None
+
+    def configure_project_packages(self, env: str, targets: Any = None) -> None:
+        self.configured.append((env, self.config))
+
+    def install_required_packages(self, force: bool = False) -> None:
+        self.required_installed_with = self.config
+
+
+def _install_stubs() -> tuple[dict[str, Any], dict[str, Any]]:
+    record: dict[str, Any] = {"installs": [], "platform": _RecordingPlatform()}
+
+    class _Manager(_StubPlatformPackageManager):
+        def install(self, spec: Any, skip_dependencies: bool = False, **kwargs: Any) -> Any:
+            record["installs"].append((spec, skip_dependencies, kwargs))
+            return SimpleNamespace(path="/platforms/x")
+
+    factory = SimpleNamespace(new=lambda pkg: record["platform"])
+    modules = _stub_modules(
+        **{
+            "platformio.package.manager.platform": SimpleNamespace(
+                PlatformPackageManager=_Manager
+            ),
+            "platformio.platform.factory": SimpleNamespace(PlatformFactory=factory),
+        }
+    )
+    return modules, record
+
+
+class _UserView:
+    def get(self, section: str, option: str, default: Any = None) -> Any:
+        return {"platform": "espressif32@^7", "platform_packages": []}.get(option, default)
+
+
+def test_real_adapter_install_platform_uses_user_view(tmp_path: Path) -> None:
+    """The user's spec is installed without PlatformIO configuring it from the global config
+    (which includes pio.lock.ini); its packages are configured from the user's view."""
+    modules, record = _install_stubs()
+    view = _UserView()
+
+    class _Adapter(_StubAdapter):
+        def user_config(self, project_dir: Path) -> Any:
+            return view
+
+    _Adapter(modules).install_platform(tmp_path, "esp32")
+    assert record["installs"] == [("espressif32@^7", True, {})]
+    platform = record["platform"]
+    assert platform.configured == [("esp32", view)]
+    assert platform.required_installed_with is view
+    assert platform.project_env == "esp32"
+
+
+def test_real_adapter_install_platform_given_spec(tmp_path: Path) -> None:
+    modules, record = _install_stubs()
+
+    class _Adapter(_StubAdapter):
+        def user_config(self, project_dir: Path) -> Any:
+            return _UserView()
+
+    _Adapter(modules).install_platform(tmp_path, "esp32", spec="platformio/espressif32@7.1.0")
+    assert record["installs"][0][0] == "platformio/espressif32@7.1.0"
+
+
+def test_real_adapter_install_platform_failure_is_clean(tmp_path: Path) -> None:
+    modules, _record = _install_stubs()
+    manager = modules["platformio.package.manager.platform"].PlatformPackageManager
+
+    def install(self: Any, spec: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("UnknownPackageError: could not find espressif32@^7")
+
+    manager.install = install
+
+    class _Adapter(_StubAdapter):
+        def user_config(self, project_dir: Path) -> Any:
+            return _UserView()
+
+    with pytest.raises(pio_lock.PlatformInstallError, match="espressif32@\\^7"):
+        _Adapter(modules).install_platform(tmp_path, "esp32")
+
+
+def test_not_installed_hint_names_capture_install() -> None:
+    assert str(PlatformNotInstalled("esp32")) == (
+        "platform for env 'esp32' is not installed; run: pio-lock capture --install -e esp32"
+    )
+
+
+def test_capture_install_installs_a_changed_platform(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    fake = fake_pio({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    (tmp_project / "platformio.ini").write_text(
+        "[platformio]\nextra_configs = pio.lock.ini\n[env:testenv]\nplatform = espressif32@^7\n"
+    )
+    del fake.platforms["testenv"]
+    fake.installable = {"espressif32@^7": _lock(version="7.1.0")}
+
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 1
+    assert "run: pio-lock capture --install -e testenv" in capsys.readouterr().err
+    assert fake.installed_calls == []
+
+    assert pio_lock.capture(tmp_project, ["testenv"], install=True) == 0
+    assert fake.installed_calls == [("testenv", None)]
+    platform = _read_lock(tmp_project)["envs"]["testenv"]["platform"]
+    assert (platform["spec"], platform["version"]) == ("espressif32@^7", "7.1.0")
+    assert "platform = platformio/espressif32@7.1.0" in (tmp_project / "pio.lock.ini").read_text()
+
+
+def test_capture_install_skips_installed_platforms(tmp_project: Path, fake_pio: Any) -> None:
+    fake = fake_pio({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"], install=True) == 0
+    assert fake.installed_calls == []
+
+
+def test_capture_install_failure_is_an_error(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    fake = fake_pio({})
+    fake.install_error = pio_lock.PlatformInstallError("could not install espressif32: offline")
+    assert pio_lock.capture(tmp_project, ["testenv"], install=True) == 1
+    assert "Error: could not install espressif32: offline" in capsys.readouterr().err
+    assert not (tmp_project / "pio.lock.json").exists()
+
+
+def test_cli_capture_install_flag(tmp_project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(pio_lock, "capture", lambda *a, **k: calls.append(k) or 0)
+    assert pio_lock.main(["-d", str(tmp_project), "capture", "-e", "testenv", "--install"]) == 0
+    assert calls[-1].get("install") is True
+    assert pio_lock.main(["-d", str(tmp_project), "capture", "-e", "testenv"]) == 0
+    assert not calls[-1].get("install")
+
+
+def test_update_installs_platforms_through_the_adapter(
+    tmp_project: Path, platform_update: Any
+) -> None:
+    """``pio pkg install --platform`` would configure the new platform from pio.lock.ini (the
+    old pins); the adapter installs it with the user's view."""
+    install, pio_commands = platform_update
+    fake = install({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    _move_to(fake, "6.7.0")
+    assert pio_lock.update(tmp_project, ["testenv"]) == 0
+    assert fake.installed_calls == [("testenv", "platformio/espressif32@6.7.0")]
+    assert not any("--platform" in c for c in pio_commands())
+    assert _read_lock(tmp_project)["envs"]["testenv"]["platform"]["version"] == "6.7.0"
+
+
+def test_update_platform_install_failure_reports_and_keeps_lock(
+    tmp_project: Path, platform_update: Any, capsys: Any
+) -> None:
+    install, _ = platform_update
+    fake = install({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    _move_to(fake, "6.7.0")
+    fake.install_error = pio_lock.PlatformInstallError("could not install espressif32: offline")
+    assert pio_lock.update(tmp_project, ["testenv"]) == 1
+    err = capsys.readouterr().err
+    assert "Error: could not install espressif32: offline" in err
+    assert "were NOT changed" in err
+    assert _read_lock(tmp_project)["envs"]["testenv"]["platform"]["version"] == "6.6.0"

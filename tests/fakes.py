@@ -71,6 +71,9 @@ class FakePioAdapter:
     PlatformLock for ``resolve_platform(..., installed_spec=...)``. ``installed_packages`` is
     the set of (name, version) ``package_installed`` accepts (default: every package of
     ``platforms``). ``incompatible`` names a call: probe/resolve/in_use then raise PioIncompatible.
+    ``installable`` maps a platform spec -> the PlatformLock ``install_platform`` makes
+    resolvable (for the env, and by that spec); every call is recorded in ``installed_calls`` as
+    (env, spec). ``install_error`` makes ``install_platform`` raise it.
     Config views are real configparser reads of the project.
     """
 
@@ -83,8 +86,13 @@ class FakePioAdapter:
         installed_packages: Optional[set[tuple[str, str]]] = None,
         latest_versions: Optional[dict[str, Optional[str]]] = None,
         by_spec: Optional[dict[str, PlatformLock]] = None,
+        installable: Optional[dict[str, PlatformLock]] = None,
     ) -> None:
         self.platforms = platforms
+        self.installable = installable or {}
+        self.installed_calls: list[tuple[str, Optional[str]]] = []
+        self.install_error: Optional[Exception] = None
+        self.probes = 0
         self.by_spec = by_spec or {}
         self.resolved_with: dict[str, Optional[str]] = {}
         self.in_use = in_use or {}
@@ -101,6 +109,7 @@ class FakePioAdapter:
         return self.core
 
     def probe(self) -> None:
+        self.probes += 1
         self._check()
 
     def user_config(self, project_dir: Path) -> FakeConfigView:
@@ -135,6 +144,17 @@ class FakePioAdapter:
             spec=str(spec),
             platform_packages_spec=list(view.get(f"env:{env}", "platform_packages", [])),
         )
+
+    def install_platform(self, project_dir: Path, env: str, spec: Optional[str] = None) -> None:
+        self._check()
+        self.installed_calls.append((env, spec))
+        if self.install_error is not None:
+            raise self.install_error
+        key = spec or str(self.user_config(project_dir).get(f"env:{env}", "platform", ""))
+        if key in self.installable:
+            self.by_spec[key] = self.installable[key]
+            if spec is None:
+                self.platforms[env] = self.installable[key]
 
     def package_installed(
         self, package: dict[str, Any], project_dir: Optional[Path] = None

@@ -337,7 +337,7 @@ def test_platform_drift_fails_in_release_mode(build: Any, fake_pio: Any, capsys:
     assert build.run() == [1]
     out = capsys.readouterr().out
     assert "ERROR: platform spec changed: 'espressif32' → 'espressif32@^7'" in out
-    assert "run: pio-lock capture -e testenv" in out
+    assert "run: pio-lock capture --install -e testenv" in out
 
 
 # Same spec as platformio.ini, so the lock is not stale: only the override check can catch it.

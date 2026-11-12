@@ -625,7 +625,49 @@ def test_lock_ini_end_to_end(tmp_path: Path) -> None:
     stale = run_pio(p, "run", "-e", "native", env=_RELEASE)
     assert stale.returncode != 0, stale.stdout
     assert "platform spec changed" in stale.stdout
-    assert "run: pio-lock capture -e native" in stale.stdout
+    assert "run: pio-lock capture --install -e native" in stale.stdout
+
+
+def _local_platform(root: Path, name: str = "piolocktest") -> str:
+    """A minimal platform in a local directory (nothing to download); returns its file:// spec."""
+    platform = root / f"{name}-platform"
+    (platform / "builder").mkdir(parents=True)
+    (platform / "platform.json").write_text(
+        json.dumps({"name": name, "version": "0.0.1", "engines": {"platformio": "^6"}})
+    )
+    (platform / "builder" / "main.py").write_text('Import("env")\n')
+    return platform.as_uri()
+
+
+@requires_pio
+def test_capture_install_records_a_changed_platform(tmp_path: Path) -> None:
+    """With pio.lock.ini included, `pio pkg install -e <env>` installs the LOCKED platform, so
+    a changed `platform =` can only be captured with `capture --install`."""
+    p, env_body = _locked_build_project(tmp_path)
+    spec = _local_platform(tmp_path)
+    _set_env(p, env_body, spec)
+    cli = [sys.executable, str(REPO_ROOT / "pio_lock.py"), "-d", str(p)]
+    try:
+        assert run_pio(p, "pkg", "install", "-e", "native").returncode == 0
+        plain = _run_cli([*cli, "capture", "-e", "native"])
+        assert plain.returncode == 1, plain.stdout
+        assert "run: pio-lock capture --install -e native" in plain.stdout
+
+        installed = _run_cli([*cli, "capture", "--install", "-e", "native"])
+        assert installed.returncode == 0, installed.stdout
+        platform = _lockfile(p)["envs"]["native"]["platform"]
+        assert (platform["spec"], platform["name"], platform["version"]) == (
+            spec,
+            "piolocktest",
+            "0.0.1",
+        )
+        assert f"platform = {spec}\n" in (p / "pio.lock.ini").read_text()
+    finally:
+        subprocess.run(
+            ["pio", "pkg", "uninstall", "-g", "-p", "piolocktest"],
+            capture_output=True,
+            timeout=300,
+        )
 
 
 @requires_pio
