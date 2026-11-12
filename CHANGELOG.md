@@ -5,7 +5,7 @@ Follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-11-11
+## [0.4.0] - 2026-11-12
 
 pio-lock now locks each env's platform and platform packages as well as its libraries, can be
 set up with a `lib_deps` line alone, and records the git ref you asked for. See the README's
