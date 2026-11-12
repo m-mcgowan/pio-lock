@@ -1,0 +1,17 @@
+{
+  "name": "pio-lock",
+  "version": "0.3.0",
+  "description": "PlatformIO dependency lockfile tool for reproducible builds",
+  "keywords": "lockfile, reproducible, build",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/m-mcgowan/pio-lock.git"
+  },
+  "build": {
+    "extraScript": "pio_lock.py"
+  },
+  "export": {
+    "include": ["pio_lock.py", "library.json", "README.md", "LICENSE"]
+  }
+}

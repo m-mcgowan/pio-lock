@@ -1517,12 +1517,73 @@ def update(
 # ── PlatformIO extra_script integration ──────────────────────────────────────
 
 
-def register_pio_targets(env: Any) -> None:
-    """Register custom PIO targets when loaded as an extra_script.
+_LOAD_MARKER = "PIO_LOCK_LOADED_BY"
 
-    Add to platformio.ini:
+
+def _load_origin(env: Any) -> str:
+    """Return how this copy of pio_lock was loaded.
+
+    ``platform``: imported as module ``pio_lock`` (e.g. by pioarduino).
+    ``library``: run as a library.json ``extraScript`` (lib_deps), which PlatformIO
+    executes with a library builder environment rather than the project environment.
+    ``extra_scripts``: a ``pre:``/``post:`` line in platformio.ini.
+    """
+    if __name__ == "pio_lock":
+        return "platform"
+    try:
+        if env.get("PIOBUILDER") is not None or env.get("_PIO_LIB_BUILDER"):
+            return "library"
+    except Exception:  # noqa: BLE001 - fakes/other envs without get()
+        pass
+    try:
+        libdeps = env.subst("$PROJECT_LIBDEPS_DIR")
+        here = str(Path(__file__).resolve())
+        if libdeps and here.startswith(str(Path(libdeps).resolve()) + os.sep):
+            # Under libdeps and not a project-level script line.
+            return "library"
+    except Exception:  # noqa: BLE001
+        pass
+    return "extra_scripts"
+
+
+def _already_loaded(env: Any) -> bool:
+    """Record the first load on the shared DefaultEnvironment; report repeats.
+
+    A module global would not do: the SConscript exec and a pioarduino import are
+    different module objects, but all share the SCons DefaultEnvironment.
+    """
+    try:
+        from SCons.Script import DefaultEnvironment  # type: ignore[import-not-found]
+
+        shared = DefaultEnvironment()
+    except ImportError:
+        shared = env
+    origin = _load_origin(env)
+    first = shared.get(_LOAD_MARKER)
+    if first is None:
+        shared[_LOAD_MARKER] = origin
+        return False
+    if first == "platform":
+        print(
+            "pio-lock: already loaded by the platform (custom_pio_lock); "
+            "remove pio-lock from lib_deps or extra_scripts"
+        )
+    else:
+        print(
+            "pio-lock: already loaded via lib_deps; the extra_scripts line for "
+            "pio_lock.py is deprecated since 0.4.0 and can be removed"
+        )
+    return True
+
+
+def register_pio_targets(env: Any) -> None:
+    """Register custom PIO targets when loaded via lib_deps or as an extra_script.
+
+    Preferred (0.4.0+): add pio-lock to ``lib_deps``. Legacy:
         extra_scripts = pre:path/to/pio_lock.py
     """
+    if _already_loaded(env):
+        return
     project_dir = Path(env.subst("$PROJECT_DIR"))
 
     # Collect environments from the PIO config
