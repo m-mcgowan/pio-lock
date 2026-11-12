@@ -78,8 +78,10 @@ def test_cli_help_without_platformio() -> None:
 def test_cli_locks_libraries_without_platformio(tmp_path: Path) -> None:
     project = tmp_path / "project"
     shutil.copytree(FIXTURES / "registry-exact", project)
-    (project / "pio.lock.json").unlink()
-    (project / "pio.lock.ini").unlink()
+    # Other tests may leave generated (gitignored) lock files in the fixture; a clean
+    # checkout has none.
+    (project / "pio.lock.json").unlink(missing_ok=True)
+    (project / "pio.lock.ini").unlink(missing_ok=True)
 
     result = _run_cli_without_pio("capture", "-d", str(project), "-e", "native")
 
