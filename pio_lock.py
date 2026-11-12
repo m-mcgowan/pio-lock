@@ -669,6 +669,9 @@ def capture(
     try:
         config: Any = adapter.user_config(project_dir)
         configured: Optional[set[str]] = set(config.envs())
+    except ProjectConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     except PioIncompatible:
         config, configured = None, None  # can't read the config: no validation, no pruning
     if config is not None and configured is not None:
@@ -930,7 +933,7 @@ def check(project_dir: Path, envs: list[str], warn_only: bool = False) -> int:
                     for problem in drift:
                         problems_found = True
                         print(f"  {label}: {problem}")
-                except ValueError as exc:
+                except ValueError as exc:  # includes ProjectConfigError
                     print(f"Error: {exc}", file=sys.stderr)
                     return 1
                 except PioIncompatible as exc:
@@ -1042,6 +1045,10 @@ class PioIncompatible(Exception):  # noqa: N818 (name fixed by the 0.4.0 interfa
         )
 
 
+class ProjectConfigError(ValueError):
+    """platformio.ini (or one of its extra_configs) could not be parsed."""
+
+
 class PlatformNotInstalled(Exception):  # noqa: N818 (name fixed by the 0.4.0 interface)
     """The platform (or one of its packages) an env resolves to is not installed."""
 
@@ -1128,6 +1135,28 @@ class PioAdapter:
     # ── Project config views ──
 
     def _config_view(self, project_dir: Path, include_lock_ini: bool) -> tuple[Any, list[Path]]:
+        """``_read_config_view``, with config parse failures raised as ProjectConfigError."""
+        try:
+            return self._read_config_view(project_dir, include_lock_ini)
+        except (PioIncompatible, ValueError):
+            raise
+        except Exception as exc:
+            # PlatformIO raises InvalidProjectConfError (not importable without PlatformIO, so
+            # matched by name) or configparser errors for an unparsable ini.
+            if (
+                isinstance(exc, configparser.Error)
+                or type(exc).__name__ == "InvalidProjectConfError"
+            ):
+                raise ProjectConfigError(
+                    f"invalid PlatformIO project configuration in "
+                    f"{Path(project_dir) / 'platformio.ini'} (or its extra_configs): "
+                    f"{_describe(exc)}"
+                ) from exc
+            raise
+
+    def _read_config_view(
+        self, project_dir: Path, include_lock_ini: bool
+    ) -> tuple[Any, list[Path]]:
         """Read platformio.ini and its extra_configs like PlatformIO does, but CWD-independent.
 
         PlatformIO resolves ``extra_configs`` globs against the process CWD and expands

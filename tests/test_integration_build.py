@@ -542,3 +542,20 @@ print(json.dumps({
         pytest.skip("no tool packages installed")
     assert out["exact"] is True
     assert out["wrong"] is False
+
+
+@requires_pio
+def test_check_malformed_ini_is_clean_error(tmp_path: Path) -> None:
+    p = make_native_project(tmp_path, "[env:native]\nplatform = native\n")
+    cli = [sys.executable, str(REPO_ROOT / "pio_lock.py"), "-d", str(p)]
+    assert subprocess.run([*cli, "capture", "-e", "native"], capture_output=True).returncode == 0
+    (p / "platformio.ini").write_text("[env:native\nplatform = native\n")
+    result = subprocess.run(
+        [*cli, "check", "-e", "native"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert result.returncode == 1, result.stdout
+    assert "Error: invalid PlatformIO project configuration" in result.stdout
+    assert "Traceback" not in result.stdout

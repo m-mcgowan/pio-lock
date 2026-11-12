@@ -6,6 +6,7 @@ overridden ``_import``; everything else uses ``tests.fakes.FakePioAdapter``.
 
 from __future__ import annotations
 
+import configparser
 import json
 import os
 import subprocess
@@ -1044,7 +1045,35 @@ def test_real_adapter_package_installed_incompatible_api() -> None:
         adapter.package_installed({"name": "tool-a", "version": "1.0.0"})
 
 
-def test_check_malformed_ini_is_clean_error(tmp_project: Path, fake_pio: Any, capsys: Any) -> None:
-    _locked_project(tmp_project, fake_pio, _lock())
-    (tmp_project / "platformio.ini").write_text("[env:testenv]\nboard = x\n")
-    assert pio_lock.check(tmp_project, ["testenv"]) == 1  # stale spec: platform now ''
+def test_check_config_error_is_clean_error(
+    tmp_project: Path, fake_pio: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    adapter = fake_pio({"testenv": _lock()})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+
+    def broken(project_dir: Path) -> Any:
+        raise pio_lock.ProjectConfigError("invalid PlatformIO project configuration in x")
+
+    monkeypatch.setattr(adapter, "user_config", broken)
+    assert pio_lock.check(tmp_project, ["testenv"]) == 1
+    assert "Error: invalid PlatformIO project configuration" in capsys.readouterr().err
+
+
+class InvalidProjectConfError(Exception):
+    """Stands in for platformio.project.exception.InvalidProjectConfError (matched by name)."""
+
+
+@pytest.mark.parametrize("exc", [InvalidProjectConfError("bad"), configparser.Error("bad")])
+def test_real_adapter_converts_config_parse_errors(tmp_path: Path, exc: Exception) -> None:
+    class _Config:
+        BUILTIN_VARS: ClassVar[dict[str, Any]] = {}
+
+        def __init__(self, path: str, parse_extra: bool = True) -> None:
+            raise exc
+
+    modules = _stub_modules(
+        **{"platformio.project.config": SimpleNamespace(ProjectConfig=_Config)}
+    )
+    (tmp_path / "platformio.ini").write_text("[env:x\n")
+    with pytest.raises(pio_lock.ProjectConfigError, match=r"platformio\.ini"):
+        _StubAdapter(modules).user_config(tmp_path)
