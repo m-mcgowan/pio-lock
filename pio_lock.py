@@ -2,15 +2,22 @@
 """
 pio-lock — PlatformIO dependency lockfile tool.
 
-Captures resolved dependency versions into a lockfile (pio.lock.json) for
-reproducible builds. Works alongside platformio.ini, which declares desired
-version ranges; this tool records the exact versions that were actually installed.
+Captures each env's platform, platform packages and libraries into a lockfile
+(pio.lock.json) for reproducible builds, and generates pio.lock.ini, which pins the
+platform and its packages when included from platformio.ini via extra_configs.
+platformio.ini states what is acceptable; the lock records what was installed.
 
 Can be used as:
-  1. Standalone CLI:  python pio_lock.py capture -e myenv
-  2. PIO extra_script: adds "lock-capture", "lock-check", "lock-restore" targets
+  1. Library (preferred):  lib_deps = https://github.com/m-mcgowan/pio-lock.git
+     library.json loads this script into the build: a drift check on every build plus
+     the lock-capture / lock-check / lock-restore and snapshot-* targets.
+  2. PIO extra_script:     extra_scripts = pre:scripts/pio_lock.py (a copy in the project)
+  3. Standalone CLI:       pip install pio-lock, then
+                           pio-lock capture|restore|check|outdated|update|init -e myenv
+                           (or: python pio_lock.py <command> ...)
+  4. Imported by a platform (pioarduino custom_pio_lock): register_pio_targets(env)
 
-Requires: Python 3.8+, git CLI, PlatformIO Core CLI
+Requires: Python 3.9+, git CLI, PlatformIO Core 6.1.18+
 """
 
 from __future__ import annotations

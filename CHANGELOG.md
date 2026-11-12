@@ -5,6 +5,87 @@ Follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-11
+
+pio-lock now locks each env's platform and platform packages as well as its libraries, can be
+set up with a `lib_deps` line alone, and records the git ref you asked for. See the README's
+"Pinning the platform", "What a plain `pio run` pins" and "Updating" sections.
+
+### Breaking
+- **Lockfile format v2.** `pio.lock.json` gains `lockfile_version: 2` and a per-env `platform`
+  object (spec, resolved name/version/source and the packages the env uses). The top-level
+  `global_packages` and `platform_url` keys are removed. v1 files are still read (libraries work
+  as before; platform checks are skipped with a hint). **Fix:** re-run
+  `pio-lock capture -e <env>` (or `pio run -t lock-capture`) and commit `pio.lock.json` and the
+  new `pio.lock.ini`.
+- **`update` applies by default.** It installs the newer versions, re-captures the lock, and
+  rewrites versions in `platformio.ini` that move within your declared range. Use `--dry-run` to
+  preview or `--lock-only` to leave `platformio.ini` alone. `--apply` is accepted as a deprecated
+  no-op. No `.bak` files are written any more.
+- **Drift fails release builds.** When pio-lock is loaded in a build, it compares the env with
+  `pio.lock.json` on every build. In release mode (`PIO_RELEASE_BUILD=1`,
+  `custom_reproducible_release = true`, or a pinned snapshot) library or platform drift stops
+  the build. **Fix** (to keep 0.3.x behaviour): `PIO_LOCK_DRIFT=warn` or
+  `custom_pio_lock_drift = warn`.
+- A config file read after `pio.lock.ini` that sets `platform` or `platform_packages` for a
+  locked env is an error (drift). **Fix:** move `pio.lock.ini` last in `extra_configs`, or allow
+  it with `PIO_LOCK_ALLOW_OVERRIDE=1` / `custom_pio_lock_allow_override = true`.
+
+### Added
+- Platform locking: `capture` records each env's platform (registry `<owner>/<name>@<version>`,
+  git/URL platforms pinned to the resolved commit) and the packages it uses, and writes
+  `pio.lock.ini`. Include it with `[platformio] extra_configs = pio.lock.ini` and a plain
+  `pio run` uses the locked platform and packages. Your own `platform_packages` are kept at their
+  exact versions; packages installed from local `file://` paths are recorded and checked but
+  left out of `pio.lock.ini`.
+- `pio-lock init` adds `pio.lock.ini` to `extra_configs` (`--dry-run` previews).
+- `check` and `restore` cover the platform and its packages; `restore` installs them before the
+  libraries. `check --warn-only` reports drift as warnings and exits 0.
+- Build-time drift check: library drift, platform drift, a stale lock (`platform =` or
+  `platform_packages` changed since capture) and a PlatformIO Core version mismatch (warning
+  only). Outside release mode drift warns; in a terminal the build asks whether to continue
+  (also in IDE task terminals — `PIO_LOCK_DRIFT=warn` skips the prompt). An env missing from the
+  lock, a v1 lock or a missing `pio.lock.ini` include only print a hint.
+- `lib_deps` alone sets pio-lock up: `library.json` loads `pio_lock.py` as the library's
+  extra script. pio-lock is loaded once per build, however many entry points name it.
+- `pip install pio-lock` gives a `pio-lock` command. When `platformio` isn't importable from
+  that Python, it re-runs itself under PlatformIO's Python (found with `pio system info`); if
+  that fails it locks libraries only and says how to install into PlatformIO's Python.
+- Git ref tracking: git libraries record the requested `ref` and `ref_type`. `outdated` reports
+  branches whose head moved past the locked commit, newer tags, newer registry platforms and
+  newer release URLs.
+- `update` moves the lock: bare specs and branch refs move only the lock; versions within
+  range also rewrite the ini in the style written (`^1.8.3` → `^1.8.5`); exact pins move within
+  the same major; `--beyond-range` crosses the declared range; specs it can't rewrite are
+  reported for a hand edit; edits to a section shared with other envs name those envs. Old git
+  checkouts are removed after a move. This follows pnpm / Yarn 2+ rather than Cargo / npm.
+- `capture -e <env>` updates only that env's entries and prunes envs no longer in
+  `platformio.ini`; pio-lock itself is left out of the library list. If PlatformIO's internals
+  are incompatible, the previous platform lock is kept with a warning.
+- Integration tests build real projects on the `native` platform; CI tests PlatformIO 6.1.18,
+  6.2.x and latest, plus a weekly run. `make test-pio PIO=<version>` runs them locally against
+  any PlatformIO version in isolated directories.
+
+### Fixed
+- In release mode with no `build_snapshot.json`, `pio run -t snapshot-capture` (the fix the
+  error message suggests) failed with the same error.
+- Requesting a `lock-*` or `snapshot-*` target no longer runs the build-time checks or rewrites
+  `build_snapshot.json` first, which hid the staleness `snapshot-check` exists to report.
+- An unparsable `platformio.ini` gives an error message instead of a traceback.
+- `capture` no longer crashes when the `pio` CLI isn't on `PATH`.
+
+### Deprecated
+- The `lib_deps` + `extra_scripts = pre:${PROJECT_LIBDEPS_DIR}/${PIOENV}/pio-lock/pio_lock.py`
+  combination. The `lib_deps` line now loads pio-lock by itself; the `pre:` line keeps working
+  but prints a note that it can be removed. Copy-into-project `pre:` lines are unaffected.
+
+### For integrators
+- pioarduino and other platforms that `import pio_lock`: `register_pio_targets(env)` is
+  unchanged. A second load in the same build (for example `custom_pio_lock` plus a `lib_deps`
+  line) is skipped with a message.
+- The lockfile format changed (see Breaking). The Python API and lockfile format aren't
+  guaranteed stable before 1.0 — pin the pio-lock version you integrate with.
+
 ## [0.3.0] - 2026-11-10
 
 ### Changed
@@ -70,6 +151,8 @@ Follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 ### Fixed
 - Update command now searches extra_configs files for lib_deps
 
-[Unreleased]: https://github.com/m-mcgowan/pio-lock/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/m-mcgowan/pio-lock/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/m-mcgowan/pio-lock/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/m-mcgowan/pio-lock/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/m-mcgowan/pio-lock/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/m-mcgowan/pio-lock/releases/tag/v0.1.0
