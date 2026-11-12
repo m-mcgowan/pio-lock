@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -403,39 +405,100 @@ def test_incompatible_pio_fails_release_with_v2_lock(
     assert "ERROR: platform not checked: PlatformIO Core" in capsys.readouterr().out
 
 
+_PROMPT_LINE = "Continue with this build? [c]ontinue / [a]bort:\n"
+
+
+class _Stdin(io.StringIO):
+    """Answers for the prompt; reading it after the answers run out is EOF."""
+
+    def __init__(self, text: str = "", tty: bool = True) -> None:
+        super().__init__(text)
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+def _answer(monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+    monkeypatch.setattr(pio_lock, "_is_interactive", lambda: True)
+    monkeypatch.setattr(sys, "stdin", _Stdin(text))
+
+
 def test_interactive_abort_exits(build: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
     build.drift_library()
-    monkeypatch.setattr(pio_lock, "_is_interactive", lambda: True)
-    prompts: list[str] = []
-    answers = iter(["x", "a"])
-
-    def fake_input(prompt: str) -> str:
-        prompts.append(prompt)
-        return next(answers)
-
-    monkeypatch.setattr("builtins.input", fake_input)
+    _answer(monkeypatch, "x\na\n")
     assert build.run() == [1]
-    assert prompts == ["Continue with this build? [c]ontinue / [a]bort: "] * 2
-    assert "WARNING: MyLib — expected 1.0.0" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # A whole line, so it shows through PlatformIO's line-by-line pipe.
+    assert out.count(_PROMPT_LINE) == 2
+    assert "WARNING: MyLib — expected 1.0.0" in out
 
 
 def test_interactive_continue_proceeds(build: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     build.drift_library()
-    monkeypatch.setattr(pio_lock, "_is_interactive", lambda: True)
-    monkeypatch.setattr("builtins.input", lambda _prompt: "c")
+    _answer(monkeypatch, "c\n")
     assert build.run() == []
 
 
-def test_interactive_release_never_prompts(build: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("text", ["", "\n"], ids=["eof", "empty"])
+def test_interactive_eof_or_empty_answer_aborts(
+    build: Any, monkeypatch: pytest.MonkeyPatch, text: str
+) -> None:
+    build.drift_library()
+    _answer(monkeypatch, text)
+    assert build.run() == [1]
+
+
+def test_interactive_release_never_prompts(
+    build: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
     build.drift_library()
     build.release()
-    monkeypatch.setattr(pio_lock, "_is_interactive", lambda: True)
-
-    def no_input(_prompt: str) -> str:
-        raise AssertionError("prompted in release mode")
-
-    monkeypatch.setattr("builtins.input", no_input)
+    _answer(monkeypatch, "c\n")
     assert build.run() == [1]
+    assert _PROMPT_LINE not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("stdin_tty", "isatty_arg", "expected"),
+    [
+        (True, "1", True),
+        (True, "0", False),
+        (True, None, False),
+        (False, "1", False),
+        (True, "junk", False),
+    ],
+)
+def test_interactive_needs_stdin_tty_and_isatty_build_arg(
+    monkeypatch: pytest.MonkeyPatch, stdin_tty: bool, isatty_arg: Any, expected: bool
+) -> None:
+    import types
+
+    scons = types.ModuleType("SCons")
+    script = types.ModuleType("SCons.Script")
+    script.ARGUMENTS = {} if isatty_arg is None else {"ISATTY": isatty_arg}  # type: ignore[attr-defined]
+    scons.Script = script  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "SCons", scons)
+    monkeypatch.setitem(sys.modules, "SCons.Script", script)
+    monkeypatch.setattr(sys, "stdin", _Stdin(tty=stdin_tty))
+    # PlatformIO pipes the build's stdout, so stdout is never a tty there: it must not matter.
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    assert pio_lock._is_interactive() is expected
+
+
+def test_interactive_false_outside_scons(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "SCons.Script", None)  # import fails
+    monkeypatch.setattr(sys, "stdin", _Stdin(tty=True))
+    assert pio_lock._is_interactive() is False
+
+
+def test_env_not_in_lock_is_hint_only(build: Any, capsys: Any) -> None:
+    build.release()
+    pio_lock.build_checks(build.project, "other", build.env)
+    assert build.env.exit_codes == []
+    out = capsys.readouterr().out
+    assert "pio-lock: env 'other' is not in pio.lock.json; run pio-lock capture -e other" in out
+    assert "ERROR" not in out and "WARNING" not in out
 
 
 def test_lock_target_run_skips_checks(

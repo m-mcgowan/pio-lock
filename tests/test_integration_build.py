@@ -672,3 +672,70 @@ def test_release_build_override_allowed(tmp_path: Path) -> None:
     allowed = run_pio(p, "run", "-e", "native", env={**_RELEASE, "PIO_LOCK_ALLOW_OVERRIDE": "1"})
     assert allowed.returncode == 0, allowed.stdout
     assert "WARNING: late.ini sets platform" in allowed.stdout
+
+
+_PROMPT = "Continue with this build? [c]ontinue / [a]bort:"
+
+
+def _pio_run_in_pty(p: Path, answer: str, timeout: float = 600) -> tuple[int, str]:
+    """Run ``pio run`` with a pseudo-terminal as stdin/stdout; type ``answer`` at the prompt."""
+    pty = pytest.importorskip("pty")
+    import select
+    import time
+
+    master, slave = pty.openpty()
+    proc = subprocess.Popen(
+        ["pio", "run", "-e", "native", "-d", str(p)],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env={k: v for k, v in os.environ.items() if k != "PIO_RELEASE_BUILD"},
+        close_fds=True,
+    )
+    os.close(slave)
+    output = b""
+    answered = False
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], 1.0)
+            if ready:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:  # EIO: the child closed the terminal
+                    break
+                if not chunk:
+                    break
+                output += chunk
+            elif proc.poll() is not None:
+                break
+            if not answered and _PROMPT.encode() in output:
+                os.write(master, answer.encode())
+                answered = True
+        rc = proc.wait(timeout=max(1.0, deadline - time.monotonic()))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        os.close(master)
+    return rc, output.decode(errors="replace")
+
+
+@requires_pio
+@pytest.mark.skipif(not hasattr(os, "openpty"), reason="needs pseudo-terminals")
+def test_interactive_build_abort_under_pty(tmp_path: Path) -> None:
+    p, env_body = _locked_build_project(tmp_path)
+    _set_env(p, env_body, "native@*")
+    rc, out = _pio_run_in_pty(p, "a\n")
+    assert _PROMPT in out, out
+    assert rc != 0, out
+
+
+@requires_pio
+@pytest.mark.skipif(not hasattr(os, "openpty"), reason="needs pseudo-terminals")
+def test_interactive_build_continue_under_pty(tmp_path: Path) -> None:
+    p, env_body = _locked_build_project(tmp_path)
+    _set_env(p, env_body, "native@*")
+    rc, out = _pio_run_in_pty(p, "c\n")
+    assert _PROMPT in out, out
+    assert rc == 0, out
+    assert "SUCCESS" in out

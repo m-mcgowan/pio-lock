@@ -904,6 +904,15 @@ def _allow_override_from_env() -> Optional[bool]:
     return None
 
 
+def _lock_ini_position(project_dir: Path, files: list[Path]) -> Optional[int]:
+    """Index of pio.lock.ini among the config files PlatformIO reads (None: not included)."""
+    lock_ini = os.path.realpath(Path(project_dir) / LOCK_INI_NAME)
+    for i, path in enumerate(files):
+        if os.path.realpath(path) == lock_ini:
+            return i
+    return None
+
+
 def lock_overrides(project_dir: Path, env: str, adapter: PioAdapter) -> list[str]:
     """One message per config file read after pio.lock.ini that sets a locked option for ``env``.
 
@@ -912,13 +921,12 @@ def lock_overrides(project_dir: Path, env: str, adapter: PioAdapter) -> list[str
     pio.lock.ini is not included. May raise PioIncompatible or ValueError like the adapter.
     """
     project_dir = Path(project_dir)
-    lock_ini = os.path.realpath(project_dir / LOCK_INI_NAME)
     files = adapter.config_files(project_dir)
-    positions = [i for i, f in enumerate(files) if os.path.realpath(f) == lock_ini]
-    if not positions:
+    position = _lock_ini_position(project_dir, files)
+    if position is None:
         return []
     messages: list[str] = []
-    for path in files[positions[0] + 1 :]:
+    for path in files[position + 1 :]:
         parser = configparser.ConfigParser(interpolation=None, strict=False)
         try:
             parser.read(path, encoding="utf-8")
@@ -2293,7 +2301,7 @@ def _already_loaded(env: Any) -> bool:
 
 _DRIFT_INI_OPTION = "custom_pio_lock_drift"
 _ALLOW_OVERRIDE_INI_OPTION = "custom_pio_lock_allow_override"
-_DRIFT_PROMPT = "Continue with this build? [c]ontinue / [a]bort: "
+_DRIFT_PROMPT = "Continue with this build? [c]ontinue / [a]bort:"
 _INCLUDE_HINT = (
     f"pio-lock: add 'extra_configs = {LOCK_INI_NAME}' (or run pio-lock init) to pin the platform"
 )
@@ -2328,9 +2336,21 @@ def _allow_override(env: Any) -> bool:
 
 
 def _is_interactive() -> bool:
+    """Whether someone can answer a prompt from inside the build.
+
+    PlatformIO runs SCons with stdout piped (never a tty there) and passes ``ISATTY=1`` when
+    its own stdout is a terminal; stdin is inherited.
+    """
     try:
-        return sys.stdin.isatty() and sys.stdout.isatty()
+        if not sys.stdin.isatty():
+            return False
     except (AttributeError, ValueError):
+        return False
+    try:
+        from SCons.Script import ARGUMENTS  # type: ignore[import-not-found]
+
+        return bool(int(ARGUMENTS.get("ISATTY", 0)))
+    except (ImportError, TypeError, ValueError):
         return False
 
 
@@ -2365,8 +2385,7 @@ def _platform_build_findings(
     findings: _BuildFindings,
 ) -> None:
     """Platform checks for a v2 lock: include hint, drift, later-config overrides."""
-    lock_ini = os.path.realpath(Path(project_dir) / LOCK_INI_NAME)
-    if not any(os.path.realpath(f) == lock_ini for f in adapter.config_files(project_dir)):
+    if _lock_ini_position(project_dir, adapter.config_files(project_dir)) is None:
         findings.hints.append(_INCLUDE_HINT)
         return
     if not env_lock.get("platform"):
@@ -2399,7 +2418,9 @@ def _collect_build_findings(
         return findings
     env_lock = lockdata.get("envs", {}).get(env_name)
     if env_lock is None:
-        findings.problem(f"env '{env_name}' is not in {LOCKFILE_NAME}", findings.capture_fix)
+        findings.hints.append(
+            f"env '{env_name}' is not in {LOCKFILE_NAME}; run pio-lock capture -e {env_name}"
+        )
         return findings
 
     for lib in env_lock.get("libraries", []):
@@ -2434,14 +2455,18 @@ def _collect_build_findings(
 
 
 def _ask_to_continue() -> bool:
+    """Prompt until continue or abort; an empty answer or EOF aborts.
+
+    The prompt is a whole line: PlatformIO forwards the build's output line by line, so a
+    prompt without a newline would never show.
+    """
     while True:
-        try:
-            answer = input(_DRIFT_PROMPT).strip().lower()
-        except EOFError:
-            return False
+        print(_DRIFT_PROMPT, flush=True)
+        line = sys.stdin.readline()
+        answer = line.strip().lower()
         if answer in ("c", "continue"):
             return True
-        if answer in ("a", "abort"):
+        if not answer or answer in ("a", "abort"):
             return False
 
 
