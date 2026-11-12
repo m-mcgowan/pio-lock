@@ -568,6 +568,12 @@ def linked(
         def __init__(self) -> None:
             self.env = env
 
+        def lock(self) -> None:
+            """Write pio.lock.json: only a locked project's release build fails."""
+            from tests.conftest import write_lockfile
+
+            write_lockfile(tmp_project, {"testenv": []})
+
         def build(self, *, new_built: bool, old_built: bool) -> int:
             env.lib_builders[0].is_built = new_built
             env.lib_builders[1].is_built = old_built
@@ -593,6 +599,7 @@ def test_linked_duplicates_fail_release_and_warn_otherwise(
     ) in out
 
     monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
+    linked.lock()
     assert linked.build(new_built=True, old_built=True) == 1
     captured = capsys.readouterr()
     assert "ERROR: linked duplicate copies of 'X': X, X@3.1.13" in captured.out
@@ -604,12 +611,42 @@ def test_linked_duplicates_policy_warn(
     linked: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any, via: str
 ) -> None:
     monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
+    linked.lock()
     if via == "env_var":
         monkeypatch.setenv("PIO_LOCK_DRIFT", "warn")
     else:
         linked.env.options["custom_pio_lock_drift"] = "warn"
     assert linked.build(new_built=True, old_built=True) == 0
     assert "WARNING: linked duplicate copies of 'X'" in capsys.readouterr().out
+
+
+def test_linked_duplicates_without_lockfile_only_warn_in_release(
+    linked: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
+    assert linked.build(new_built=True, old_built=True) == 0
+    captured = capsys.readouterr()
+    assert "WARNING: linked duplicate copies of 'X': X, X@3.1.13" in captured.out
+    assert "build stopped" not in captured.err
+
+
+def test_linked_check_error_is_a_warning_not_a_traceback(
+    linked: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
+    linked.lock()
+
+    class Broken:
+        path = str(linked.project / "nowhere")
+        is_built = True
+
+        @property
+        def name(self) -> str:
+            raise RuntimeError("no name")
+
+    linked.env.lib_builders = [Broken(), Broken()]
+    assert pio_lock.link_checks(linked.project, "testenv", linked.env) == 0
+    assert "pio-lock: WARNING: linked duplicates not checked: " in capsys.readouterr().out
 
 
 def test_linked_duplicates_name_the_exact_library_pin(

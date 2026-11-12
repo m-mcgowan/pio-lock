@@ -1003,7 +1003,7 @@ def duplicate_problems(groups: list[list[LibraryCopy]]) -> list[str]:
 
 
 def _in_duplicate_group(lib: dict[str, Any], groups: list[list[LibraryCopy]]) -> bool:
-    """Whether a lock entry is one of the duplicated libraries."""
+    """Whether a lock entry is one of the duplicated libraries (by dir, name or git URL)."""
     for group in groups:
         if lib.get("dir") in {c.dir for c in group}:
             return True
@@ -1022,14 +1022,22 @@ def library_findings(
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """(installed-duplicate warnings, drifted lock entries) for one env; shared by check and
     the build hook. Lock entries of a duplicated library aren't compared: the duplicate
-    warning replaces a misleading "expected ..." against an arbitrary copy."""
+    warning replaces a misleading "expected ..." against an arbitrary copy. An entry whose
+    recorded ``dir`` exists is still compared against that directory."""
     groups = find_duplicate_libraries(project_dir, env_name)
+    libdeps_dir = Path(project_dir) / ".pio" / "libdeps" / env_name
+
+    def compared(lib: dict[str, Any]) -> bool:
+        if lib.get("type") == "local":
+            return False
+        if lib.get("dir") and (libdeps_dir / str(lib["dir"])).is_dir():
+            return True
+        return not _in_duplicate_group(lib, groups)
+
     drifted = [
         lib
         for lib in env_lock.get("libraries", [])
-        if lib.get("type") != "local"
-        and not _in_duplicate_group(lib, groups)
-        and not is_installed_at_locked_version(project_dir, env_name, lib)
+        if compared(lib) and not is_installed_at_locked_version(project_dir, env_name, lib)
     ]
     return duplicate_problems(groups), drifted
 
@@ -3892,9 +3900,18 @@ def link_checks(project_dir: Path, env_name: str, env: Any) -> int:
     """Before linking: report libraries built into the image more than once.
 
     Two copies of one library in one image is the real fault (separate archives, one symbol
-    namespace). It fails a release build unless the drift policy is ``warn``; otherwise it
-    warns. Returns non-zero to stop the build.
+    namespace). In a locked project (pio.lock.json present) it fails a release build unless
+    the drift policy is ``warn``; otherwise it warns. Returns non-zero to stop the build.
+    The check itself never breaks a build: any error is reported as a warning.
     """
+    try:
+        return _link_checks(project_dir, env_name, env)
+    except Exception as exc:
+        print(f"pio-lock: WARNING: linked duplicates not checked: {_describe(exc)}")
+        return 0
+
+
+def _link_checks(project_dir: Path, env_name: str, env: Any) -> int:
     builders = _built_lib_builders(env)
     if builders is None:
         print(
@@ -3905,7 +3922,11 @@ def link_checks(project_dir: Path, env_name: str, env: Any) -> int:
     problems = linked_duplicate_problems(project_dir, env_name, builders)
     if not problems:
         return 0
-    fail = _is_release_mode(load_snapshot(project_dir), env) and drift_policy(env) == "fail"
+    fail = (
+        (Path(project_dir) / LOCKFILE_NAME).exists()
+        and _is_release_mode(load_snapshot(project_dir), env)
+        and drift_policy(env) == "fail"
+    )
     label = "ERROR" if fail else "WARNING"
     print(f"pio-lock: env '{env_name}':")
     for problem in problems:

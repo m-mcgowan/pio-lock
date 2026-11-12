@@ -759,57 +759,95 @@ def _install_fake_copy(p: Path, dir_name: str, version: str, function: str) -> N
     (lib / "src" / f"{function}.c").write_text(f"int {function}(void) {{ return 1; }}\n")
 
 
-def _duplicates_project(tmp_path: Path, lib_deps: list[str], main: str) -> Path:
-    """dupdemo 1.1.0 (``dupdemo/``) and 1.0.0 (``dupdemo@1.0.0/``) installed side by side."""
+def _duplicates_project(
+    tmp_path: Path, lib_deps: list[str], main: str, *, via_lib_deps: bool = False
+) -> Path:
+    """dupdemo 1.1.0 (``dupdemo/``) and 1.0.0 (``dupdemo@1.0.0/``) installed side by side.
+
+    pio-lock is loaded with an ``extra_scripts`` line, or (``via_lib_deps``) from lib_deps,
+    where its library.json runs it as an extra script in a library builder's environment.
+    """
     p = make_native_project(tmp_path / "proj", "[env:native]\nplatform = native\n")
     lib = piolock_lib(p)
     (p / ".gitignore").write_text(".pio/\nbuild_snapshot.json\n")
-    deps = "".join(f"\n    {spec}" for spec in lib_deps)
+    specs = [*lib_deps, f"file://{lib}"] if via_lib_deps else lib_deps
+    loader = "" if via_lib_deps else f"extra_scripts = pre:{lib}/pio_lock.py\n"
+    deps = "".join(f"\n    {spec}" for spec in specs)
     (p / "platformio.ini").write_text(
-        f"[env:native]\nplatform = native\nextra_scripts = pre:{lib}/pio_lock.py\n"
-        f"lib_deps ={deps}\n"
+        f"[env:native]\nplatform = native\n{loader}lib_deps ={deps}\n"
     )
     (p / "src" / "main.cpp").write_text(main)
     _install_fake_copy(p, "dupdemo", "1.1.0", "dupdemo_new")
     _install_fake_copy(p, "dupdemo@1.0.0", "1.0.0", "dupdemo_old")
+    installed = run_pio(p, "pkg", "install", "-e", "native")
+    assert installed.returncode == 0, installed.stdout
     _commit_and_snapshot(p)
     return p
 
 
+def _capture(p: Path) -> subprocess.CompletedProcess[str]:
+    """pio-lock capture for env native, then commit and refresh the snapshot."""
+    cli = [sys.executable, str(REPO_ROOT / "pio_lock.py"), "-d", str(p)]
+    captured = _run_cli([*cli, "capture", "-e", "native"])
+    assert captured.returncode == 0, captured.stdout
+    _commit_and_snapshot(p)
+    return captured
+
+
+# Two lib_deps specs (in real projects often from different ini files) select one copy each,
+# so PlatformIO builds and links both. (A bare "1.0.0" in a library.json does not: PlatformIO's
+# LDF ignores a version without an operator when picking the copy.)
+_BOTH_SPECS = ["piolocktest/dupdemo @ 1.1.0", "piolocktest/dupdemo @ 1.0.0"]
+_BOTH_MAIN = (
+    'extern "C" int dupdemo_new(void);\nextern "C" int dupdemo_old(void);\n'
+    "int main() { return dupdemo_new() + dupdemo_old(); }\n"
+)
+_LINKED = (
+    "linked duplicate copies of 'dupdemo': dupdemo, dupdemo@1.0.0 — both are built "
+    "into this image; make the requirements agree"
+)
+
+
 @requires_pio
 def test_build_fails_in_release_when_two_copies_are_linked(tmp_path: Path) -> None:
-    # Two lib_deps specs (in real projects often from different ini files) select one copy
-    # each, so PlatformIO builds and links both. (A bare "1.0.0" in a library.json does not:
-    # PlatformIO's LDF ignores a version without an operator when picking the copy.)
-    p = _duplicates_project(
-        tmp_path,
-        ["piolocktest/dupdemo @ 1.1.0", "piolocktest/dupdemo @ 1.0.0"],
-        'extern "C" int dupdemo_new(void);\nextern "C" int dupdemo_old(void);\n'
-        "int main() { return dupdemo_new() + dupdemo_old(); }\n",
-    )
-    linked = (
-        "linked duplicate copies of 'dupdemo': dupdemo, dupdemo@1.0.0 — both are built "
-        "into this image; make the requirements agree"
-    )
+    p = _duplicates_project(tmp_path, _BOTH_SPECS, _BOTH_MAIN)
+    _capture(p)
 
     released = run_pio(p, "run", "-e", "native", env=_RELEASE)
     assert released.returncode != 0, released.stdout
-    assert f"ERROR: {linked}" in released.stdout
+    assert f"ERROR: {_LINKED}" in released.stdout
     assert "build stopped" in released.stdout
 
     warned = run_pio(p, "run", "-e", "native", env={**_RELEASE, "PIO_LOCK_DRIFT": "warn"})
     assert warned.returncode == 0, warned.stdout
-    assert f"WARNING: {linked}" in warned.stdout
+    assert f"WARNING: {_LINKED}" in warned.stdout
 
     # A program that already exists (the warn build above) is still checked on relink.
-    (p / "src" / "main.cpp").write_text(
-        'extern "C" int dupdemo_new(void);\nextern "C" int dupdemo_old(void);\n'
-        "int main() { return dupdemo_new() - dupdemo_old(); }\n"
-    )
+    (p / "src" / "main.cpp").write_text(_BOTH_MAIN.replace("+ dupdemo_old", "- dupdemo_old"))
     _commit_and_snapshot(p)
     relinked = run_pio(p, "run", "-e", "native", env=_RELEASE)
     assert relinked.returncode != 0, relinked.stdout
-    assert f"ERROR: {linked}" in relinked.stdout
+    assert f"ERROR: {_LINKED}" in relinked.stdout
+
+
+@requires_pio
+def test_linked_copies_fail_release_when_loaded_from_lib_deps(tmp_path: Path) -> None:
+    p = _duplicates_project(tmp_path, _BOTH_SPECS, _BOTH_MAIN, via_lib_deps=True)
+    _capture(p)
+
+    released = run_pio(p, "run", "-e", "native", env=_RELEASE)
+    assert released.returncode != 0, released.stdout
+    assert f"ERROR: {_LINKED}" in released.stdout
+
+
+@requires_pio
+def test_linked_copies_only_warn_without_a_lockfile(tmp_path: Path) -> None:
+    p = _duplicates_project(tmp_path, _BOTH_SPECS, _BOTH_MAIN)
+    assert not (p / "pio.lock.json").exists()
+
+    released = run_pio(p, "run", "-e", "native", env=_RELEASE)
+    assert released.returncode == 0, released.stdout
+    assert f"WARNING: {_LINKED}" in released.stdout
 
 
 @requires_pio
@@ -819,11 +857,8 @@ def test_build_passes_when_only_one_installed_copy_is_linked(tmp_path: Path) -> 
         ["piolocktest/dupdemo @ 1.1.0"],
         'extern "C" int dupdemo_new(void);\nint main() { return dupdemo_new(); }\n',
     )
-    cli = [sys.executable, str(REPO_ROOT / "pio_lock.py"), "-d", str(p)]
-    captured = _run_cli([*cli, "capture", "-e", "native"])
-    assert captured.returncode == 0, captured.stdout
+    captured = _capture(p)
     assert "Warning: duplicate copies of 'dupdemo'" in captured.stdout
-    _commit_and_snapshot(p)
 
     released = run_pio(p, "run", "-e", "native", env=_RELEASE)
     assert released.returncode == 0, released.stdout

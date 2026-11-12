@@ -66,7 +66,8 @@ set up with a `lib_deps` line alone, and records the git ref you asked for. See 
   `.pio/libdeps/<env>`, matched by manifest name or git URL) warn in `capture`, `restore`,
   `check` and the build, with who requested each copy and which `library.json` pins a
   dependency exactly. Linked duplicates (two copies built into one image) are checked just
-  before linking and fail a release build under the drift policy. See the README's "Duplicate
+  before linking and fail a locked project's release build under the drift policy (without
+  `pio.lock.json` they warn). See the README's "Duplicate
   library copies".
 - Each locked library records its libdeps directory as `dir`.
 - `-d/--project-dir` is accepted after the subcommand as well as before it.
@@ -83,8 +84,8 @@ set up with a `lib_deps` line alone, and records the git ref you asked for. See 
 - `capture` no longer crashes when the `pio` CLI isn't on `PATH`.
 - `check` compared every lock entry of a library installed twice against the first directory
   found, giving a permanent `DRIFT: … expected <version>` (or a SHA that depended on directory
-  order); duplicated libraries now get the duplicate warning instead, and other entries are
-  compared against their recorded `dir`.
+  order); duplicated libraries now get the duplicate warning instead, and entries are compared
+  against their recorded `dir` when it exists.
 - `capture` skipped every `<name>@src-<hash>` directory, so a git library installed only there
   was missing from the lock; these checkouts are now recorded.
 

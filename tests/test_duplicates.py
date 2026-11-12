@@ -308,3 +308,52 @@ def test_restore_warns_on_duplicates(tmp_project, make_registry_lib, mock_git_co
     captured = capsys.readouterr()
     assert f"Warning: duplicate copies of '{UBLOX}'" in captured.err
     assert "Restoring 2 libraries" in captured.out
+
+
+def test_check_still_compares_a_duplicated_entry_with_its_dir(
+    tmp_project, make_registry_lib, mock_git_commands, capsys, monkeypatch
+):
+    monkeypatch.delenv("PIO_LOCK_DRIFT", raising=False)
+    make_registry_lib("testenv", "X", "3.1.16", project_dir=tmp_project)
+    make_registry_lib("testenv", "X", "3.1.13", project_dir=tmp_project, dir_name="X@3.1.13")
+    write_lockfile(
+        tmp_project,
+        {
+            "testenv": [
+                {
+                    "name": "X", "type": "registry", "version": "3.1.15",
+                    "owner": "testowner", "dir": "X",
+                },
+                {
+                    "name": "X", "type": "registry", "version": "3.1.13",
+                    "owner": "testowner", "dir": "X@3.1.13",
+                },
+            ]
+        },
+    )  # fmt: skip
+
+    assert pio_lock.check(tmp_project, ["testenv"]) == 1
+    out = capsys.readouterr().out
+    assert "WARNING: duplicate copies of 'X'" in out
+    assert "DRIFT: X — expected 3.1.15" in out
+    assert "expected 3.1.13" not in out
+
+
+def test_entry_with_missing_dir_falls_back_to_name_and_url(
+    tmp_project, make_registry_lib, make_git_lib, mock_git_commands
+):
+    make_registry_lib("testenv", "X", "1.0.0", project_dir=tmp_project)
+    make_git_lib(
+        "testenv", "bridge", sha="b" * 40, url="https://github.com/acme/bridge.git",
+        project_dir=tmp_project,
+    )  # fmt: skip
+    registry = {"name": "X", "type": "registry", "version": "1.0.0", "dir": "X@src-gone"}
+    git = {
+        "name": "bridge", "type": "git", "url": "https://github.com/acme/bridge.git",
+        "sha": "b" * 40, "dir": "bridge@src-other-machine",
+    }  # fmt: skip
+    assert pio_lock.is_installed_at_locked_version(tmp_project, "testenv", registry)
+    assert pio_lock.is_installed_at_locked_version(tmp_project, "testenv", git)
+    assert not pio_lock.is_installed_at_locked_version(
+        tmp_project, "testenv", {**registry, "version": "2.0.0"}
+    )
