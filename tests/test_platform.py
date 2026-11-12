@@ -31,11 +31,26 @@ from tests.fakes import FakePioAdapter
 # ── Stub PlatformIO modules ─────────────────────────────────────────────────
 
 
+class _StubPackageSpec:
+    def __init__(self, owner: Any = None, name: Any = None) -> None:
+        self.owner, self.name = owner, name
+
+
 class _StubPlatformPackageManager:
     installed: ClassVar[dict[str, Any]] = {}
 
+    registry: ClassVar[Any] = {"versions": [{"name": "6.9.0"}, {"name": "6.6.0"}]}
+
     def get_package(self, spec: str) -> Any:
         return self.installed.get(spec)
+
+    def fetch_registry_package(self, spec: Any) -> Any:
+        if isinstance(self.registry, Exception):
+            raise self.registry
+        return self.registry
+
+    def pick_best_registry_version(self, versions: Any, spec: Any = None) -> Any:
+        return versions[0] if versions else None
 
 
 class _StubToolPackageManager:
@@ -70,6 +85,7 @@ def _stub_modules(**overrides: Any) -> dict[str, Any]:
         "platformio.package.manager.tool": SimpleNamespace(
             ToolPackageManager=_StubToolPackageManager
         ),
+        "platformio.package.meta": SimpleNamespace(PackageSpec=_StubPackageSpec),
         "platformio.platform.factory": SimpleNamespace(PlatformFactory=SimpleNamespace(new=None)),
         "platformio.platform.base": SimpleNamespace(PlatformBase=_StubPlatformBase),
     }
@@ -120,6 +136,24 @@ def test_probe_reports_missing_attribute() -> None:
 
 def test_probe_passes_with_all_internals_present() -> None:
     _StubAdapter(_stub_modules()).probe()
+
+
+def test_latest_platform_version_picks_best_registry_version() -> None:
+    adapter = _StubAdapter(_stub_modules())
+    assert adapter.latest_platform_version("espressif32", "platformio") == "6.9.0"
+
+
+def test_latest_platform_version_none_on_network_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_StubPlatformPackageManager, "registry", OSError("offline"))
+    assert _StubAdapter(_stub_modules()).latest_platform_version("espressif32", None) is None
+
+
+def test_latest_platform_version_incompatible_when_api_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_StubPlatformPackageManager, "registry", TypeError("bad signature"))
+    with pytest.raises(PioIncompatible):
+        _StubAdapter(_stub_modules()).latest_platform_version("espressif32", None)
 
 
 def test_core_version_unknown_without_platformio() -> None:

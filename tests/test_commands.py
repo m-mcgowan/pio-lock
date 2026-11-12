@@ -538,3 +538,67 @@ class TestCLI:
             ]
         )
         assert rc == 0
+
+
+class TestCaptureGitRefs:
+    """capture records the requested ref from the lib_deps spec."""
+
+    @staticmethod
+    def _capture_lib(tmp_project, make_git_lib, fake_pio, spec, url="https://github.com/o/x.git"):
+        (tmp_project / "platformio.ini").write_text(
+            f"[env:testenv]\nplatform = espressif32\nboard = esp32dev\nlib_deps =\n  {spec}\n"
+        )
+        make_git_lib("testenv", "x", sha="abc123", url=url, project_dir=tmp_project)
+        fake_pio({"testenv": espressif32_lock()})
+        assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+        data = json.loads((tmp_project / "pio.lock.json").read_text())
+        return data["envs"]["testenv"]["libraries"][0]
+
+    def test_capture_records_branch_ref_from_spec(self, tmp_project, make_git_lib, fake_pio):
+        lib = self._capture_lib(
+            tmp_project, make_git_lib, fake_pio, "https://github.com/o/x.git#main"
+        )
+        assert lib["ref"] == "main"
+        assert lib["ref_type"] == "branch"
+
+    def test_capture_records_tag_ref(self, tmp_project, make_git_lib, fake_pio):
+        lib = self._capture_lib(
+            tmp_project, make_git_lib, fake_pio, "https://github.com/o/x.git#v1.2.0"
+        )
+        assert lib["ref"] == "v1.2.0"
+        assert lib["ref_type"] == "tag"
+
+    def test_capture_ref_none_without_hash(self, tmp_project, make_git_lib, fake_pio):
+        lib = self._capture_lib(tmp_project, make_git_lib, fake_pio, "https://github.com/o/x.git")
+        assert lib["ref"] is None
+        assert lib["ref_type"] == "default"
+
+    def test_capture_ref_none_without_matching_spec(self, tmp_project, make_git_lib, fake_pio):
+        lib = self._capture_lib(
+            tmp_project, make_git_lib, fake_pio, "https://github.com/o/other.git#main"
+        )
+        assert lib["ref"] is None
+        assert lib["ref_type"] == "default"
+
+    def test_capture_ref_matches_url_variants(self, tmp_project, make_git_lib, fake_pio):
+        lib = self._capture_lib(
+            tmp_project,
+            make_git_lib,
+            fake_pio,
+            "git+https://github.com/o/x.git#main",
+            url="https://github.com/o/x",
+        )
+        assert lib["ref"] == "main"
+        assert lib["ref_type"] == "branch"
+
+    def test_capture_ref_matches_named_spec_and_trailing_slash(
+        self, tmp_project, make_git_lib, fake_pio
+    ):
+        lib = self._capture_lib(
+            tmp_project,
+            make_git_lib,
+            fake_pio,
+            "x=git+https://github.com/o/x/#v2.0",
+            url="https://github.com/o/x.git",
+        )
+        assert lib["ref"] == "v2.0"

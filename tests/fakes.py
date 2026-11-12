@@ -80,12 +80,14 @@ class FakePioAdapter:
         incompatible: Optional[str] = None,
         core: str = "6.1.18",
         installed_packages: Optional[set[tuple[str, str]]] = None,
+        latest_versions: Optional[dict[str, Optional[str]]] = None,
     ) -> None:
         self.platforms = platforms
         self.in_use = in_use or {}
         self.incompatible = incompatible
         self.core = core
         self.installed_packages = installed_packages
+        self.latest_versions = latest_versions or {}
 
     def _check(self) -> None:
         if self.incompatible:
@@ -141,3 +143,7 @@ class FakePioAdapter:
             raise PlatformNotInstalled(env)
         lock = self.platforms[env]
         return lock.name, lock.version
+
+    def latest_platform_version(self, name: str, owner: Optional[str] = None) -> Optional[str]:
+        self._check()
+        return self.latest_versions.get(name)

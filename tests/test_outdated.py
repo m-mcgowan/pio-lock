@@ -1175,3 +1175,105 @@ class TestCheckTagDepPrerelease:
         result = pio_lock._check_tag_dep("owner", "repo", "v1.0.0", "lib", github)
         assert result is not None
         assert result["status"] == "up_to_date"
+
+
+# ── Branch heads and registry platforms ──────────────────────────────────────
+
+
+LOCKED = "a" * 40
+HEAD = "b" * 40
+
+
+class TestCheckBranchDep:
+    def test_outdated_reports_branch_head_moved(self):
+        github = FakeGitHubClient({"repos/o/r/branches/main": {"commit": {"sha": HEAD}}})
+        result = pio_lock._check_branch_dep("o", "r", "main", LOCKED, "lib", github)
+        assert result is not None
+        assert result["name"] == "lib"
+        assert result["status"] == "outdated"
+        assert result["current"] == LOCKED[:7]
+        assert result["latest"] == HEAD[:7]
+        assert "main" in result["message"]
+
+    def test_outdated_branch_head_unchanged(self):
+        github = FakeGitHubClient({"repos/o/r/branches/main": {"commit": {"sha": LOCKED}}})
+        assert pio_lock._check_branch_dep("o", "r", "main", LOCKED, "lib", github) is None
+
+    def test_unreachable_is_none(self):
+        github = FakeGitHubClient({})
+        assert pio_lock._check_branch_dep("o", "r", "main", LOCKED, "lib", github) is None
+
+    def test_git_dep_branch_uses_sha_from_version(self):
+        github = FakeGitHubClient({"repos/o/r/branches/dev": {"commit": {"sha": HEAD}}})
+        result = pio_lock._check_git_dep(
+            "https://github.com/o/r.git#dev", "lib", f"1.0.0+sha.{LOCKED}", github
+        )
+        assert result is not None and result["status"] == "outdated"
+
+    def test_git_dep_default_branch(self):
+        github = FakeGitHubClient(
+            {
+                "repos/o/r": {"default_branch": "trunk"},
+                "repos/o/r/branches/trunk": {"commit": {"sha": HEAD}},
+            }
+        )
+        result = pio_lock._check_git_dep(
+            "https://github.com/o/r.git", "lib", f"1.0.0+sha.{LOCKED}", github
+        )
+        assert result is not None and result["latest"] == HEAD[:7]
+
+
+def _env_lock(version: str = "6.6.0", src_url=None) -> dict[str, Any]:
+    return {
+        "platform": {
+            "name": "espressif32",
+            "version": version,
+            "src_url": src_url,
+            "owner": "platformio",
+            "spec": "espressif32",
+            "packages": [],
+        },
+        "libraries": [],
+    }
+
+
+class TestCheckRegistryPlatform:
+    def _install(self, monkeypatch, latest):
+        from tests.fakes import FakePioAdapter
+
+        adapter = FakePioAdapter(platforms={}, latest_versions=latest)
+        monkeypatch.setattr(pio_lock, "_pio_adapter_factory", lambda: adapter)
+
+    def test_outdated_reports_newer_registry_platform(self, tmp_path, monkeypatch):
+        self._install(monkeypatch, {"espressif32": "6.9.0"})
+        result = pio_lock._check_registry_platform(tmp_path, "e", _env_lock("6.6.0"))
+        assert result is not None
+        assert result["status"] == "outdated"
+        assert result["current"] == "6.6.0"
+        assert result["latest"] == "6.9.0"
+        assert "6.9.0" in result["message"]
+
+    def test_up_to_date(self, tmp_path, monkeypatch):
+        self._install(monkeypatch, {"espressif32": "6.6.0"})
+        result = pio_lock._check_registry_platform(tmp_path, "e", _env_lock("6.6.0"))
+        assert result is not None and result["status"] == "up_to_date"
+
+    def test_url_platform_skipped(self, tmp_path, monkeypatch):
+        self._install(monkeypatch, {"espressif32": "9.0.0"})
+        env_lock = _env_lock("6.6.0", src_url="https://example.com/p.zip")
+        assert pio_lock._check_registry_platform(tmp_path, "e", env_lock) is None
+
+    def test_registry_unreachable_is_none(self, tmp_path, monkeypatch):
+        self._install(monkeypatch, {})
+        assert pio_lock._check_registry_platform(tmp_path, "e", _env_lock()) is None
+
+    def test_outdated_command_reports_registry_platform(
+        self, tmp_path, mock_pio, monkeypatch, capsys
+    ):
+        (tmp_path / "platformio.ini").write_text("[env:test]\nplatform = espressif32\n")
+        lock = {"lockfile_version": 2, "envs": {"test": _env_lock("6.6.0")}}
+        (tmp_path / "pio.lock.json").write_text(json.dumps(lock))
+        self._install(monkeypatch, {"espressif32": "6.9.0"})
+        rc = pio_lock.outdated(tmp_path, ["test"])
+        assert rc == 1
+        assert "6.9.0" in capsys.readouterr().out

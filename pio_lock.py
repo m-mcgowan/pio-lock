@@ -651,6 +651,37 @@ def env_lock_is_stale(
     return bool(_lock_staleness(platform, user_platform_spec, user_platform_packages))
 
 
+_LIB_DEP_URL_RE = re.compile(
+    r"(?:git\+)?([A-Za-z][A-Za-z0-9+.-]*://[^\s#]+|git@[^\s#]+)(?:#(\S+))?"
+)
+
+
+def _normalize_git_url(url: str) -> str:
+    """Compare-key for a git URL: no ``git+`` prefix, trailing ``/`` or ``.git``; case-folded."""
+    url = url.strip()
+    if url.startswith("git+"):
+        url = url[4:]
+    url = url.rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    return url.rstrip("/").lower()
+
+
+def _annotate_git_refs(libraries: list[dict[str, Any]], lib_deps: Any) -> None:
+    """Set ``ref``/``ref_type`` on git entries from the matching ``lib_deps`` spec (by URL)."""
+    refs: dict[str, Optional[str]] = {}
+    for spec in lib_deps or []:
+        match = _LIB_DEP_URL_RE.search(str(spec))
+        if match:
+            refs.setdefault(_normalize_git_url(match.group(1)), match.group(2))
+    for lib in libraries:
+        if lib.get("type") != "git" or not lib.get("url"):
+            continue
+        ref = refs.get(_normalize_git_url(str(lib["url"])))
+        lib["ref"] = ref
+        lib["ref_type"] = _classify_git_ref(ref)
+
+
 def capture(
     project_dir: Path,
     envs: list[str],
@@ -714,6 +745,8 @@ def capture(
         libraries = [
             lib for lib in scan_env_libraries(project_dir, env_name) if lib["name"] != "pio-lock"
         ]
+        lib_deps = config.get(f"env:{env_name}", "lib_deps", []) if config is not None else []
+        _annotate_git_refs(libraries, lib_deps)
         env_lock["libraries"] = libraries
         captured[env_name] = env_lock
         print(f"    Found {len(libraries)} libraries")
@@ -1143,6 +1176,9 @@ _PIO_INTERNALS: tuple[tuple[str, str], ...] = (
     ("platformio.platform.base", "PlatformBase.configure_project_packages"),
     ("platformio.platform.base", "PlatformBase.packages"),
     ("platformio.platform.base", "PlatformBase.get_package"),
+    ("platformio.package.manager.platform", "PlatformPackageManager.fetch_registry_package"),
+    ("platformio.package.manager.platform", "PlatformPackageManager.pick_best_registry_version"),
+    ("platformio.package.meta", "PackageSpec"),
 )
 
 
@@ -1392,6 +1428,23 @@ class PioAdapter:
                 for pkg in manager.get_installed()
             )
 
+    def latest_platform_version(self, name: str, owner: Optional[str] = None) -> Optional[str]:
+        """Newest registry version of a platform, or None if the registry can't be reached."""
+        manager_cls = self._lookup("platformio.package.manager.platform", "PlatformPackageManager")
+        spec_cls = self._lookup("platformio.package.meta", "PackageSpec")
+        call = "platformio.package.manager.platform.PlatformPackageManager.fetch_registry_package"
+        try:
+            with self._calling(call):
+                manager = manager_cls()
+                spec = spec_cls(owner=owner, name=name) if owner else spec_cls(name=name)
+                package = manager.fetch_registry_package(spec)
+                best = manager.pick_best_registry_version(package["versions"])
+                return str(best["name"]) if best else None
+        except PioIncompatible:
+            raise
+        except Exception:  # network/registry failure: nothing to report
+            return None
+
     def platform_in_use(self, project_dir: Path, env: str) -> tuple[str, str]:
         """(name, version) of the platform a build of ``env`` uses (pio.lock.ini included)."""
         project_dir = Path(project_dir).resolve()
@@ -1624,8 +1677,45 @@ def _check_git_dep(
     elif ref_type == "tag":
         assert ref is not None
         return _check_tag_dep(owner, repo, ref, name, github)
-    # branch and default — PIO already handles these via git ls-remote
-    return None
+    locked_sha = _locked_sha(current_version)
+    if locked_sha is None:
+        return None
+    if ref_type == "branch":
+        assert ref is not None
+        return _check_branch_dep(owner, repo, ref, locked_sha, name, github)
+    # default: the repository's default branch
+    repo_info = github.get_json(f"repos/{owner}/{repo}")
+    default_branch = repo_info.get("default_branch") if isinstance(repo_info, dict) else None
+    if not default_branch:
+        return None
+    return _check_branch_dep(owner, repo, str(default_branch), locked_sha, name, github)
+
+
+def _locked_sha(version: str) -> Optional[str]:
+    """The resolved commit in a PlatformIO git package version (``+sha.<rev>`` or a bare sha)."""
+    match = _GIT_SHA_SUFFIX_RE.search(version)
+    if match:
+        return match.group(1)
+    return version if _SHA_RE.match(version) else None
+
+
+def _check_branch_dep(
+    owner: str, repo: str, branch: str, locked_sha: str, name: str, github: GitHubClient
+) -> Optional[dict[str, Any]]:
+    """Report a branch whose head is no longer the locked commit; None if unchanged/unreachable."""
+    data = github.get_json(f"repos/{owner}/{repo}/branches/{branch}")
+    head = data.get("commit", {}).get("sha") if isinstance(data, dict) else None
+    if not head or head.startswith(locked_sha) or locked_sha.startswith(head):
+        return None
+    return {
+        "name": name,
+        "ref": branch,
+        "ref_type": "branch",
+        "status": "outdated",
+        "current": locked_sha[:7],
+        "latest": head[:7],
+        "message": f"{branch} moved {locked_sha[:7]} → {head[:7]}",
+    }
 
 
 def _check_sha_dep(
@@ -1897,6 +1987,32 @@ def _check_platform(
     }
 
 
+def _check_registry_platform(
+    project_dir: Path, env: str, env_lock: dict[str, Any]
+) -> Optional[dict[str, Any]]:
+    """Compare a registry platform's locked version with the newest registry version.
+
+    None for URL/git platforms (see ``_check_platform``), unlocked envs, or an unreachable
+    registry. Raises PioIncompatible if PlatformIO's registry API changed.
+    """
+    platform = env_lock.get("platform")
+    if not platform or platform.get("src_url"):
+        return None
+    name, current = str(platform["name"]), str(platform["version"])
+    latest = _pio_adapter_factory().latest_platform_version(name, platform.get("owner"))
+    if not latest:
+        return None
+    base = {"env": env, "name": name, "current": current}
+    if _version_sort_key(latest) > _version_sort_key(current):
+        return {
+            **base,
+            "status": "outdated",
+            "latest": latest,
+            "message": f"{current} → {latest} available",
+        }
+    return {**base, "status": "up_to_date", "message": "latest release"}
+
+
 # ── Outdated / update helpers ────────────────────────────────────────────────
 
 
@@ -1956,6 +2072,27 @@ def _get_outdated_entries(
     return entries
 
 
+def _registry_platform_results(project_dir: Path, envs: list[str]) -> list[dict[str, Any]]:
+    """Registry-platform checks for the locked envs; skipped when there is no lockfile."""
+    lockfile_path = project_dir / LOCKFILE_NAME
+    if not lockfile_path.exists():
+        return []
+    locked_envs = load_lockfile(lockfile_path).get("envs", {})
+    results: list[dict[str, Any]] = []
+    for env_name in envs:
+        env_lock = locked_envs.get(env_name)
+        if not env_lock:
+            continue
+        try:
+            result = _check_registry_platform(project_dir, env_name, env_lock)
+        except PioIncompatible as exc:
+            print(f"  Warning: registry platform check skipped: {exc}", file=sys.stderr)
+            return results
+        if result:
+            results.append(result)
+    return results
+
+
 def outdated(
     project_dir: Path,
     envs: list[str],
@@ -1983,7 +2120,12 @@ def outdated(
             "Set GITHUB_TOKEN or install gh for git dependency update detection."
         )
 
+    registry_platform_results = _registry_platform_results(project_dir, envs)
+
     has_outdated = any(e["is_outdated"] for e in entries)
+    has_registry_platform_outdated = any(
+        r["status"] == "outdated" for r in registry_platform_results
+    )
     has_git_outdated = any(r["status"] == "outdated" for r in git_results)
     has_platform_outdated = platform_result is not None and platform_result["status"] in (
         "outdated",
@@ -1995,11 +2137,21 @@ def outdated(
             "libraries": entries,
             "git_deps": git_results,
             "platform": platform_result,
+            "registry_platforms": registry_platform_results,
         }
         if github_skipped_reason:
             data["github_skipped"] = github_skipped_reason
         print(json.dumps(data, indent=2))
-        return 1 if (has_outdated or has_git_outdated or has_platform_outdated) else 0
+        return (
+            1
+            if (
+                has_outdated
+                or has_git_outdated
+                or has_platform_outdated
+                or has_registry_platform_outdated
+            )
+            else 0
+        )
 
     # Table output — registry and PIO-managed deps
     registry_entries = [e for e in entries if e["type"] == "registry"]
@@ -2057,10 +2209,17 @@ def outdated(
             marker = "  "
         print(f"{marker}{platform_result['name']:<38} {platform_result['message']}")
 
+    if registry_platform_results:
+        print(f"\n{'Registry platforms'}")
+        print("-" * 76)
+        for reg in registry_platform_results:
+            marker = " *" if reg["status"] == "outdated" else "  "
+            print(f"{marker}{reg['env'] + ': ' + reg['name']:<38} {reg['message']}")
+
     if github_skipped_reason:
         print(f"\nNote: GitHub checks skipped — {github_skipped_reason}")
 
-    if has_outdated or has_git_outdated or has_platform_outdated:
+    if has_outdated or has_git_outdated or has_platform_outdated or has_registry_platform_outdated:
         print("\n* = update available")
         return 1
     else:
