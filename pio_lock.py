@@ -19,6 +19,7 @@ import argparse
 import configparser
 import contextlib
 import glob
+import hashlib
 import importlib
 import json
 import os
@@ -809,6 +810,7 @@ _PIO_INTERNALS: tuple[tuple[str, str], ...] = (
     ("platformio.project.config", "ProjectConfig.read"),
     ("platformio.project.config", "ProjectConfig.get"),
     ("platformio.project.config", "ProjectConfig.items"),
+    ("platformio.project.config", "ProjectConfig.BUILTIN_VARS"),
     ("platformio.package.manager.platform", "PlatformPackageManager.get_package"),
     ("platformio.platform.factory", "PlatformFactory.new"),
     ("platformio.platform.base", "PlatformBase.configure_project_packages"),
@@ -879,15 +881,24 @@ class PioAdapter:
     def _config_view(self, project_dir: Path, include_lock_ini: bool) -> tuple[Any, list[Path]]:
         """Read platformio.ini and its extra_configs like PlatformIO does, but CWD-independent.
 
-        PlatformIO resolves ``extra_configs`` globs against the process CWD; here they are
-        resolved against ``project_dir``. Returns the config and the files in read order.
+        PlatformIO resolves ``extra_configs`` globs against the process CWD and expands
+        ``${PROJECT_DIR}``/``${PROJECT_HASH}`` from ``os.getcwd()`` on every ``get()``; here
+        both use ``project_dir``. Returns the config and the files in read order.
         """
         project_config = self._lookup("platformio.project.config", "ProjectConfig")
+        builtin_vars = self._lookup("platformio.project.config", "ProjectConfig.BUILTIN_VARS")
         project_dir = Path(project_dir).resolve()
         main_ini = project_dir / "platformio.ini"
         lock_ini = os.path.realpath(project_dir / LOCK_INI_NAME)
         with self._calling("platformio.project.config.ProjectConfig"):
             config = project_config(str(main_ini), parse_extra=False)
+            # Per-instance override (the class dict is shared): pin the CWD-derived builtins.
+            project_hash = hashlib.sha1(str(project_dir).encode("utf-8")).hexdigest()[:10]
+            config.BUILTIN_VARS = {
+                **builtin_vars,
+                "PROJECT_DIR": lambda: str(project_dir),
+                "PROJECT_HASH": lambda: f"{project_dir.name}-{project_hash}",
+            }
         files = [main_ini]
         seen = {os.path.realpath(main_ini)}
 
@@ -945,9 +956,13 @@ class PioAdapter:
         """Resolve the env's platform and used packages from the user's view (no pio.lock.ini)."""
         project_dir = Path(project_dir).resolve()
         config = self.user_config(project_dir)
-        spec = self._platform_spec(config, env)
         factory = self._lookup("platformio.platform.factory", "PlatformFactory")
         with _chdir(project_dir):
+            spec = self._platform_spec(config, env)
+            with self._calling("platformio.project.config.ProjectConfig.get"):
+                platform_packages = [
+                    str(item) for item in config.get(f"env:{env}", "platform_packages", [])
+                ]
             pkg = self._installed_platform(spec, env)
             with self._calling("platformio.platform.factory.PlatformFactory.new"):
                 platform = factory.new(pkg)
@@ -969,10 +984,6 @@ class PioAdapter:
                 name = str(meta.name)
                 version = str(meta.version)
                 src_url = str(meta.spec.uri) if meta.spec.external else None
-        with self._calling("platformio.project.config.ProjectConfig.get"):
-            platform_packages = [
-                str(item) for item in config.get(f"env:{env}", "platform_packages", [])
-            ]
         return PlatformLock(
             spec=spec,
             platform_packages_spec=platform_packages,
@@ -1009,8 +1020,9 @@ class PioAdapter:
     def platform_in_use(self, project_dir: Path, env: str) -> tuple[str, str]:
         """(name, version) of the platform a build of ``env`` uses (pio.lock.ini included)."""
         project_dir = Path(project_dir).resolve()
-        spec = self._platform_spec(self.full_config(project_dir), env)
+        config = self.full_config(project_dir)
         with _chdir(project_dir):
+            spec = self._platform_spec(config, env)
             pkg = self._installed_platform(spec, env)
             with self._calling("platformio.package.meta.PackageMetadata"):
                 return str(pkg.metadata.name), str(pkg.metadata.version)
@@ -1058,11 +1070,16 @@ def _find_pio_python() -> Optional[str]:
 def _ensure_pio_python(argv: list[str]) -> None:
     """Re-exec this script under PlatformIO's Python unless ``platformio`` already imports.
 
-    ``PIO_LOCK_REEXEC`` marks the re-exec'd process so it never execs again. If PlatformIO's
-    Python can't be found (or is the one we're already in), warn and carry on: libraries are
-    still locked, platform locking is skipped.
+    ``PIO_LOCK_REEXEC`` marks the re-exec'd process so it never execs again; once platformio
+    imports, the marker is cleared so child processes start clean. If PlatformIO's Python
+    can't be found or exec'd, or the marker is already set but platformio still doesn't
+    import, warn and carry on: libraries are still locked, platform locking is skipped.
+
+    The re-exec runs in isolated mode (``-I``) so the calling environment's site-packages
+    and PYTHON* variables can't shadow PlatformIO's own dependencies.
     """
     if _platformio_importable():
+        os.environ.pop(_REEXEC_ENV, None)
         return
     python = None if os.environ.get(_REEXEC_ENV) else _find_pio_python()
     if python:
@@ -1070,7 +1087,7 @@ def _ensure_pio_python(argv: list[str]) -> None:
         sys.stdout.flush()
         sys.stderr.flush()
         with contextlib.suppress(OSError):  # unusable interpreter: fall through to the warning
-            os.execve(python, [python, os.path.abspath(__file__), *argv], env)
+            os.execve(python, [python, "-I", os.path.abspath(__file__), *argv], env)
     print(_PIO_PYTHON_NOT_FOUND, file=sys.stderr)
 
 

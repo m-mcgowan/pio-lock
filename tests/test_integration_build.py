@@ -274,6 +274,62 @@ def test_resolve_platform_package_not_installed(tmp_path: Path) -> None:
     assert "pio pkg install -e native" in out["resolve_platform"]["not_installed"]
 
 
+_PROJECT_DIR_CODE = """\
+import dataclasses
+import json
+from pathlib import Path
+import pio_lock
+
+adapter = pio_lock.PioAdapter()
+project = Path(sys.argv[1])
+out = {}
+for view in ("user", "full"):
+    cfg = getattr(adapter, view + "_config")(project)
+    out[view] = cfg.get("env:native", "platform_packages", [])
+out["resolve"] = dataclasses.asdict(adapter.resolve_platform(project, "native"))
+out["in_use"] = adapter.platform_in_use(project, "native")
+print(json.dumps(out))
+"""
+
+
+@requires_pio
+def test_project_dir_interpolation_independent_of_cwd(tmp_path: Path) -> None:
+    """${PROJECT_DIR} expands to the project, not the caller's CWD (PIO expands it at get())."""
+    p = _native_installed_project(tmp_path, "[env:native]\nplatform = native\n").resolve()
+    # A local tool "installed" into a project-local packages_dir (no network, no global state).
+    tool_uri = f"file://{p}/tools/mytool"
+    pkg = p / ".pkgs" / "tool-mytool"
+    pkg.mkdir(parents=True)
+    (pkg / "package.json").write_text('{"name": "tool-mytool", "version": "1.2.3"}')
+    piopm = {
+        "type": "tool",
+        "name": "tool-mytool",
+        "version": "1.2.3",
+        "spec": {
+            "owner": None,
+            "id": None,
+            "name": "tool-mytool",
+            "requirements": None,
+            "uri": tool_uri,
+        },
+    }
+    (pkg / ".piopm").write_text(json.dumps(piopm))
+    (p / "platformio.ini").write_text(
+        "[platformio]\npackages_dir = ${PROJECT_DIR}/.pkgs\n"
+        "[env:native]\nplatform = native\n"
+        "platform_packages = tool-mytool @ file://${PROJECT_DIR}/tools/mytool\n"
+    )
+    out = run_in_pio_python(_PROJECT_DIR_CODE, str(p), cwd=tmp_path.parent)
+    expected = [f"tool-mytool @ {tool_uri}"]
+    assert out["user"] == expected
+    assert out["full"] == expected
+    assert out["resolve"]["platform_packages_spec"] == expected
+    assert out["resolve"]["packages"] == [
+        {"name": "tool-mytool", "version": "1.2.3", "owner": None, "src_url": tool_uri}
+    ]
+    assert out["in_use"][0] == "native"
+
+
 # ── Running the CLI from a Python without PlatformIO ─────────────────────────
 
 _NOT_FOUND = "PlatformIO's Python not found"

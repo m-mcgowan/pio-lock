@@ -43,7 +43,7 @@ def _stub_modules(**overrides: Any) -> dict[str, Any]:
     modules: dict[str, Any] = {
         "platformio": SimpleNamespace(__version__="6.1.18"),
         "platformio.project.config": SimpleNamespace(
-            ProjectConfig=SimpleNamespace(read=None, get=None, items=None)
+            ProjectConfig=SimpleNamespace(read=None, get=None, items=None, BUILTIN_VARS={})
         ),
         "platformio.package.manager.platform": SimpleNamespace(
             PlatformPackageManager=_StubPlatformPackageManager
@@ -227,6 +227,7 @@ def test_reexec_under_pio_python_when_platformio_missing(reexec: dict[str, Any])
     assert path == "/pio/penv/bin/python"
     assert args == [
         "/pio/penv/bin/python",
+        "-I",
         os.path.abspath(pio_lock.__file__),
         "-d",
         "proj",
@@ -316,7 +317,7 @@ def test_main_without_argv_reexecs_with_sys_argv(
     monkeypatch.setattr("sys.argv", ["pio-lock", "-d", "x", "snapshot-print"])
 
     def stop(path: str, args: list[str], env: dict[str, str]) -> None:
-        raise SystemExit(args[2:])
+        raise SystemExit(args[3:])
 
     monkeypatch.setattr(os, "execve", stop)
     with pytest.raises(SystemExit) as exc_info:
@@ -335,3 +336,37 @@ def test_capture_helpers_tolerate_missing_pio_cli(
     monkeypatch.setattr(pio_lock, "_run_cmd", no_pio)
     assert pio_lock.get_pio_core_version() == "unknown"
     assert pio_lock.get_platform_url(tmp_project, "testenv") == "unknown"
+
+
+def test_reexeced_process_clears_marker(
+    reexec: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once running under PIO's Python, child processes (e.g. a nested pio-lock) start clean."""
+    monkeypatch.setenv("PIO_LOCK_REEXEC", "1")
+    reexec["importable"] = True
+    pio_lock._ensure_pio_python(["capture", "-e", "native"])
+    assert "PIO_LOCK_REEXEC" not in os.environ
+    assert reexec["exec"] is None
+
+
+def test_config_view_expands_project_dir_from_project(tmp_path: Path) -> None:
+    """The real adapter pins PROJECT_DIR/PROJECT_HASH on the view instead of os.getcwd()."""
+    created: list[Any] = []
+
+    class _Config:
+        BUILTIN_VARS: ClassVar[dict[str, Any]] = {"PROJECT_DIR": os.getcwd, "UNIX_TIME": str}
+
+        def __init__(self, path: str, parse_extra: bool = True) -> None:
+            created.append(self)
+
+        def get(self, section: str, option: str, default: Any = None) -> Any:
+            return default
+
+    modules = _stub_modules()
+    modules["platformio.project.config"] = SimpleNamespace(ProjectConfig=_Config)
+    _StubAdapter(modules).user_config(tmp_path)
+    builtins = created[0].BUILTIN_VARS
+    assert builtins["PROJECT_DIR"]() == str(tmp_path.resolve())
+    assert builtins["PROJECT_HASH"]().startswith(tmp_path.resolve().name + "-")
+    assert builtins["UNIX_TIME"] is str
+    assert _Config.BUILTIN_VARS["PROJECT_DIR"] is os.getcwd
