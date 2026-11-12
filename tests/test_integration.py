@@ -612,3 +612,52 @@ class TestConfigSourceTrackerIntegration:
         filenames = [Path(p).name for p in config._parsed]
         assert "platformio.ini" in filenames
         assert "extra.ini" in filenames
+
+
+@skip_no_pio
+class TestUpdateGitMove:
+    """Moving a git library to a new commit leaves no stale checkout behind."""
+
+    @staticmethod
+    def _commit(repo: Path, header: str) -> str:
+        (repo / "tiny.h").write_text(header)
+        identity = ["-c", "user.name=Test", "-c", "user.email=test@example.com"]
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", *identity, "-C", str(repo), "commit", "-qm", header], check=True)
+        return subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    def test_git_move_removes_detached_checkout(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        (repo / "library.json").write_text('{"name": "tiny", "version": "1.0.0"}')
+        first = self._commit(repo, "int tiny();\n")
+        second = self._commit(repo, "int tiny(); int tiny2();\n")
+        url = f"git+file://{repo}"
+
+        project = tmp_path / "proj"
+        (project / "src").mkdir(parents=True)
+        (project / "src" / "main.cpp").write_text("int main() { return 0; }\n")
+        (project / "platformio.ini").write_text(
+            f"[env:native]\nplatform = native\nlib_deps =\n    {url}#main\n"
+        )
+        for sha in (first, second):  # what update does: install the new commit, --no-save
+            subprocess.run(
+                ["pio", "pkg", "install", "-d", str(project), "-e", "native",
+                 "--library", f"{url}#{sha}", "--no-save"],
+                check=True, capture_output=True, timeout=300,
+            )  # fmt: skip
+        libdeps = project / ".pio" / "libdeps" / "native"
+        assert any("@src-" in d.name for d in libdeps.iterdir())  # PIO kept the old one
+
+        removed = pio_lock._remove_stale_git_copies(project, "native", url)
+        assert len(removed) == 1
+        dirs = [d.name for d in libdeps.iterdir() if d.is_dir()]
+        assert dirs == ["tiny"]
+        libs = pio_lock.scan_env_libraries(project, "native")
+        assert [(lib["name"], lib["sha"]) for lib in libs] == [("tiny", second)]

@@ -2388,7 +2388,7 @@ class ConfigSourceTracker:
         return [Path(f) for f in self._files]
 
 
-_EXACT_REQUIREMENT_RE = re.compile(r"^={0,2}\s*v?\d+(?:\.\d+)*$")
+_EXACT_REQUIREMENT_RE = re.compile(r"^={0,2}\s*v?\d+\.\d+\.\d+(?:\.\d+)*$")
 _REQUIREMENT_PART_RE = re.compile(r"^(\^|~|>=|<=|==|!=|>|<|=)?v?(\d+(?:\.\d+)*)$")
 
 
@@ -2401,7 +2401,10 @@ def _split_registry_spec(spec: str) -> tuple[str, Optional[str]]:
 
 
 def _requirement_kind(requirement: Optional[str]) -> str:
-    """``bare`` (no version), ``exact`` (``1.2.3``, ``==1.2.3``) or ``range`` (anything else)."""
+    """``bare`` (no version), ``exact`` (``1.2.3``, ``==1.2.3``) or ``range`` (anything else).
+
+    A partial version (``6``, ``6.6``) is a range: it allows any ``6.x`` / ``6.6.x``.
+    """
     if not requirement or requirement.strip() == "*":
         return "bare"
     if _EXACT_REQUIREMENT_RE.match(requirement.strip()):
@@ -2442,7 +2445,7 @@ def _requirement_allows(requirement: str, version: str) -> Optional[bool]:
             fixed = 2 if len(given) >= 2 else 1
             ok = ver[:fixed] == base[:fixed] and ver >= base
         elif op in ("==", "="):
-            ok = ver == base
+            ok = ver[: len(given)] == given[:3]  # a partial version matches its prefix
         elif op == "!=":
             ok = ver != base
         elif op == ">=":
@@ -2477,6 +2480,8 @@ def _build_updated_spec(spec_str: str, new_version: str) -> Optional[str]:
     match = re.match(r"^([~^>=<!]*)(\s*)([^\s,<>=!^~]+)$", version_part.strip())
     if not match or match.group(1) not in _REWRITABLE_OPERATORS:
         return None
+    if match.group(1) in ("", "=", "==") and len(match.group(3).split(".")) < 3:
+        return None  # a partial version is a range: rewriting it would narrow it
     return f"{prefix}@{lead}{match.group(1)}{match.group(2)}{new_version}"
 
 
@@ -2488,9 +2493,11 @@ def _locate_env_option(
 ) -> Optional[tuple[Path, str, str]]:
     """Where an env's option is written: (file, section, raw value), or None.
 
-    Looks in ``[env:<env>]``, then the sections it ``extends`` (in order, recursively), then
-    ``[env]``; the last file that writes a (section, option) wins, as in PlatformIO. A value
-    that is exactly ``${section.option}`` is followed to where that is written.
+    Walks sections like PlatformIO's ``ProjectConfig.walk_options``: ``[env:<env>]``, then
+    the sections it ``extends`` (later ones first, each followed by its own extends), then
+    ``[env]``; the first section that sets the option wins. The last file that writes a
+    (section, option) wins. A value that is exactly ``${section.option}`` is followed to
+    where that is written.
     """
     values: dict[tuple[str, str], tuple[Path, str]] = {}
     for path in files:
@@ -2505,21 +2512,19 @@ def _locate_env_option(
             for name, value in parser.items(section, raw=True):
                 values[(section, name)] = (Path(path), value.strip())
 
-    def find(section: str, seen: set[str]) -> Optional[str]:
-        if section in seen:
-            return None
-        seen.add(section)
+    where = None
+    queue, done = ["env", f"env:{env}"], set()
+    while queue:
+        section = queue.pop()
+        if section in done:
+            continue
+        done.add(section)
         if (section, option) in values:
-            return section
+            where = section
+            break
         extends = values.get((section, "extends"))
         if extends:
-            for parent in re.split(r"[\s,]+", extends[1]):
-                found = find(parent, seen) if parent else None
-                if found:
-                    return found
-        return None
-
-    where = find(f"env:{env}", set()) or find("env", set())
+            queue.extend(p for p in re.split(r"[\s,]+", extends[1]) if p)
     if where is None:
         return None
     key = (where, option)
@@ -2579,13 +2584,13 @@ def _same_major(a: str, b: str) -> bool:
 
 def _pick_target(
     current: str, in_range: Optional[str], newest: Optional[str], beyond_range: bool
-) -> tuple[Optional[str], Optional[str]]:
-    """(version to move to, newer version left alone because it is outside the range)."""
+) -> tuple[Optional[str], Optional[str], bool]:
+    """(version to move to, newer version left alone as outside the range, target is beyond)."""
     best_in = in_range if _is_newer(in_range, current) else None
     beyond = newest if _is_newer(newest, best_in or current) else None
     if beyond and beyond_range:
-        return beyond, None
-    return best_in, beyond
+        return beyond, None, True
+    return best_in, beyond, False
 
 
 @dataclass
@@ -2610,6 +2615,13 @@ class _Move:
     commands: list[list[str]]
     edit: Optional[_Edit] = None
     platform_spec: Optional[str] = None  # installed platform to lock (platforms only)
+    git_url: Optional[str] = None  # git library: remove stale checkouts of this repo after
+
+
+_NO_GITHUB_NOTE = (
+    "Note: {what} not checked — no GITHUB_TOKEN set and gh CLI not found. "
+    "Set GITHUB_TOKEN or install gh."
+)
 
 
 class _UpdatePlan:
@@ -2620,14 +2632,29 @@ class _UpdatePlan:
         self.moves: list[_Move] = []
         self.outside: list[str] = []
         self.skipped: list[str] = []
+        self.unchecked: list[str] = []  # what needed GitHub and wasn't checked
 
     def pio(self, env: str, *args: str) -> list[str]:
         return ["pio", "pkg", args[0], "-d", str(self.project_dir), "-e", env, *args[1:]]
 
-    def report_outside(self, name: str, version: str, spec: str) -> None:
-        line = f"{name}: {version} is outside {spec}; rerun with --beyond-range"
+    def _report(self, line: str) -> None:
         if line not in self.outside:
             self.outside.append(line)
+
+    def report_outside(self, name: str, version: str, spec: str) -> None:
+        self._report(f"{name}: {version} is outside {spec}; rerun with --beyond-range")
+
+    def report_hand_edit(self, name: str, version: str, spec: str) -> None:
+        self._report(f"{name}: {version} is outside {spec}; edit the ini by hand")
+
+    def needs_hand_edit(
+        self, beyond: bool, new_spec: Optional[str], name: str, target: str, spec: str
+    ) -> bool:
+        """A move beyond the range whose spec can't be rewritten: reported, not made."""
+        if beyond and new_spec is None and not self.lock_only:
+            self.report_hand_edit(name, target, spec)
+            return True
+        return False
 
 
 def _plan_registry_library(
@@ -2643,20 +2670,21 @@ def _plan_registry_library(
         in_range = latest if latest and _same_major(latest, current) else None
     else:
         in_range = wanted
-    target, outside = _pick_target(current, in_range, latest, plan.beyond_range)
+    target, outside, beyond = _pick_target(current, in_range, latest, plan.beyond_range)
     if outside:
         plan.report_outside(entry["name"], outside, spec_str)
     if not target:
         return
+    new_spec = _build_updated_spec(spec_str, target) if kind != "bare" else None
+    if plan.needs_hand_edit(beyond, new_spec, entry["name"], target, spec_str):
+        return
     edit = None
-    if kind != "bare" and not plan.lock_only:
-        new_spec = _build_updated_spec(spec_str, target)
-        if new_spec and new_spec != spec_str:
-            source = tracker.find_file_for_value(spec_str)
-            if source is None:
-                plan.skipped.append(f"could not locate {spec_str!r} in any config file")
-                return
-            edit = _Edit(source, spec_str, new_spec)
+    if new_spec and new_spec != spec_str and not plan.lock_only:
+        source = tracker.find_file_for_value(spec_str)
+        if source is None:
+            plan.skipped.append(f"could not locate {spec_str!r} in any config file")
+            return
+        edit = _Edit(source, spec_str, new_spec)
     env = entry["env"]
     commands = [
         plan.pio(env, "install", "--library", f"{name_part} @ =={target}", "--no-save"),
@@ -2689,7 +2717,7 @@ def _plan_git_library(
         head = str(result["head"])
         locked = _sha_from_version(str(entry["current"])) or str(entry["current"])
         commands = [plan.pio(env, "install", "--library", f"{url}#{head}", "--no-save")]
-        plan.moves.append(_Move(env, name, locked[:7], head[:7], commands))
+        plan.moves.append(_Move(env, name, locked[:7], head[:7], commands, git_url=url))
         return
     if ref_type != "tag" or ref is None:
         return  # a sha is an explicit pin
@@ -2697,7 +2725,7 @@ def _plan_git_library(
     if not newer:
         return
     same_major = [tag for tag in newer if _same_major(tag, ref)]
-    target, outside = _pick_target(
+    target, outside, _beyond = _pick_target(
         ref, same_major[0] if same_major else None, newer[0], plan.beyond_range
     )
     if outside:
@@ -2713,7 +2741,7 @@ def _plan_git_library(
             return
         edit = _Edit(source, spec_str, new_spec)
     commands = [plan.pio(env, "install", "--library", f"{url}#{target}", "--no-save")]
-    plan.moves.append(_Move(env, name, ref, target, commands, edit))
+    plan.moves.append(_Move(env, name, ref, target, commands, edit, git_url=url))
 
 
 def _platform_edit(
@@ -2742,15 +2770,19 @@ def _plan_platform(
         return
     if "://" in spec or spec.startswith("git"):
         release = _parse_platform_release_url(spec)
-        if not release or github is None:
+        if not release:
             return  # git platforms: not moved by update
+        if github is None:
+            if "GitHub release platforms" not in plan.unchecked:
+                plan.unchecked.append("GitHub release platforms")
+            return
         result = _check_release_url(spec, github)
         if not result:
             return
         current = release[2]
         in_range = result.get("latest") if result["status"] == "outdated" else None
         newest = result.get("latest_major") or in_range
-        target, outside = _pick_target(current, in_range, newest, plan.beyond_range)
+        target, outside, _beyond = _pick_target(current, in_range, newest, plan.beyond_range)
         if outside:
             plan.report_outside(str(result["name"]), outside, spec)
         if not target:
@@ -2780,31 +2812,32 @@ def _plan_platform(
     else:
         allowed = _requirement_allows(str(requirement), latest) if latest else None
         in_range = latest if allowed else None
-    target, outside = _pick_target(current, in_range, latest, plan.beyond_range)
+    target, outside, beyond = _pick_target(current, in_range, latest, plan.beyond_range)
+    name = str(result["name"])
     if outside:
-        plan.report_outside(str(result["name"]), outside, spec)
+        plan.report_outside(name, outside, spec)
     if not target:
         return
+    new_spec = _build_updated_spec(spec, target) if kind != "bare" else None
+    if plan.needs_hand_edit(beyond, new_spec, name, target, spec):
+        return
     edit = None
-    if kind != "bare" and not plan.lock_only:
-        new_spec = _build_updated_spec(spec, target)
-        if new_spec and new_spec != spec:
-            edit = _platform_edit(plan, files, env, spec, new_spec)
-            if edit is None:
-                return
+    if new_spec and new_spec != spec and not plan.lock_only:
+        edit = _platform_edit(plan, files, env, spec, new_spec)
+        if edit is None:
+            return
     install_spec = _platform_exact_spec({**locked, "version": target})
     commands = [plan.pio(env, "install", "--platform", install_spec, "--no-save")]
-    plan.moves.append(
-        _Move(env, str(result["name"]), current, target, commands, edit, install_spec)
-    )
+    plan.moves.append(_Move(env, name, current, target, commands, edit, install_spec))
 
 
-def _plan_platforms(
-    plan: _UpdatePlan,
-    envs: list[str],
-    lib_filter: Optional[str],
-    github: Optional[GitHubClient],
-) -> None:
+def _user_config_files(adapter: PioAdapter, project_dir: Path) -> list[Path]:
+    """The project's config files in read order, without pio.lock.ini."""
+    lock_ini = os.path.realpath(project_dir / LOCK_INI_NAME)
+    return [f for f in adapter.config_files(project_dir) if os.path.realpath(f) != lock_ini]
+
+
+def _plan_platforms(plan: _UpdatePlan, envs: list[str], github: Optional[GitHubClient]) -> None:
     lockfile_path = plan.project_dir / LOCKFILE_NAME
     if not lockfile_path.exists():
         return
@@ -2812,10 +2845,7 @@ def _plan_platforms(
     adapter = _pio_adapter_factory()
     try:
         config = adapter.user_config(plan.project_dir)
-        lock_ini = os.path.realpath(plan.project_dir / LOCK_INI_NAME)
-        files = [
-            f for f in adapter.config_files(plan.project_dir) if os.path.realpath(f) != lock_ini
-        ]
+        files = _user_config_files(adapter, plan.project_dir)
     except (PioIncompatible, ProjectConfigError) as exc:
         print(f"  Warning: platform update skipped: {exc}", file=sys.stderr)
         return
@@ -2825,14 +2855,66 @@ def _plan_platforms(
         spec = config.get(f"env:{env}", "platform", None)
         if not env_lock or not spec:
             continue
-        platform_name = str((env_lock.get("platform") or {}).get("name", ""))
-        if lib_filter and lib_filter.lower() not in platform_name.lower():
-            continue
         try:
             _plan_platform(plan, env, str(spec), env_lock, files, github, cache)
         except PioIncompatible as exc:
             print(f"  Warning: platform update skipped: {exc}", file=sys.stderr)
             return
+
+
+def _shared_section_notes(project_dir: Path, edits: list[_Edit], envs: list[str]) -> list[str]:
+    """Envs not being updated whose config an edit also changes (shared section or spec)."""
+    adapter = _pio_adapter_factory()
+    try:
+        all_envs = list(adapter.user_config(project_dir).envs())
+        files = _user_config_files(adapter, project_dir)
+    except (PioIncompatible, ProjectConfigError):
+        return []
+    notes: list[str] = []
+    for other in all_envs:
+        if other in envs:
+            continue
+        for edit in edits:
+            found = _locate_env_option(files, other, edit.option)
+            if found is None:
+                continue
+            path, section, raw = found
+            if Path(path).resolve() != Path(edit.path).resolve():
+                continue
+            if section == edit.section if edit.section is not None else edit.old in raw:
+                note = f"[{section}] also applies to env {other}; run pio-lock update -e {other}"
+                if note not in notes:
+                    notes.append(note)
+    return notes
+
+
+def _remove_stale_git_copies(project_dir: Path, env: str, url: str) -> list[list[str]]:
+    """Uninstall the detached ``<name>@src-<hash>`` checkouts of ``url`` in ``env``'s libdeps.
+
+    Installing a git library at another ref makes PlatformIO keep the previous checkout as a
+    detached copy, which a build could still pick up. Returns the commands run.
+    """
+    libdeps_dir = project_dir / ".pio" / "libdeps" / env
+    if not libdeps_dir.is_dir():
+        return []
+    wanted = _normalize_git_url(url)
+    commands: list[list[str]] = []
+    for lib_dir in sorted(libdeps_dir.iterdir()):
+        if "@src-" not in lib_dir.name or not (lib_dir / ".git").exists():
+            continue
+        try:
+            remote = get_git_remote_url(lib_dir)
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        if _normalize_git_url(remote) != wanted:
+            continue
+        command = [
+            "pio", "pkg", "uninstall", "-d", str(project_dir), "-e", env,
+            "--library", f"file://{lib_dir}", "--no-save",
+        ]  # fmt: skip
+        run_cmd(command, cwd=str(project_dir), check=False)
+        commands.append(command)
+    return commands
 
 
 def _display_path(path: Path, project_dir: Path) -> str:
@@ -2842,25 +2924,66 @@ def _display_path(path: Path, project_dir: Path) -> str:
         return str(path)
 
 
-def _apply_edits(edits: list[_Edit]) -> None:
+def _apply_edits(edits: list[_Edit]) -> list[_Edit]:
+    """Write the edits; returns those applied."""
+    applied: list[_Edit] = []
     for path in dict.fromkeys(edit.path for edit in edits):
         text = original = path.read_text()
+        done: list[_Edit] = []
         for edit in (e for e in edits if e.path == path):
             if edit.section is None:
-                text = _rewrite_lib_deps(text, edit.old, edit.new)
+                rewritten = _rewrite_lib_deps(text, edit.old, edit.new)
             else:
-                replaced = _replace_option_value(
-                    text, edit.section, edit.option, edit.old, edit.new
+                rewritten = (
+                    _replace_option_value(text, edit.section, edit.option, edit.old, edit.new)
+                    or text
                 )
-                if replaced is None:
-                    print(
-                        f"  Warning: could not edit {edit.option} in [{edit.section}] of {path}",
-                        file=sys.stderr,
-                    )
-                    continue
-                text = replaced
+            if rewritten == text:
+                where = f"[{edit.section}]" if edit.section else "lib_deps"
+                print(
+                    f"  Warning: could not edit {edit.old} in {where} of {path}", file=sys.stderr
+                )
+                continue
+            text = rewritten
+            done.append(edit)
         if text != original:
             _atomic_write_text(path, text)
+            applied.extend(done)
+    return applied
+
+
+def _env_flags(envs: list[str]) -> str:
+    return " ".join(f"-e {env}" for env in envs)
+
+
+def _run_update_commands(project_dir: Path, plan: _UpdatePlan, affected: list[str]) -> bool:
+    """Install/uninstall for every move; on failure report what already happened."""
+    # Platforms are installed globally: once per spec, whichever env asks first.
+    commands: dict[tuple[str, ...], list[str]] = {}
+    for command in (c for move in plan.moves for c in move.commands):
+        install_key = tuple(command[7:] if "--platform" in command else command)
+        commands.setdefault(install_key, command)
+    done: list[list[str]] = []
+    for command in commands.values():
+        check = command[2] != "uninstall"  # the old version may already be gone
+        try:
+            run_cmd(list(command), cwd=str(project_dir), check=check)
+        except subprocess.CalledProcessError as exc:
+            print(f"Error: {' '.join(command)} failed: {exc}", file=sys.stderr)
+            for previous in done:
+                verb = "installed" if previous[2] == "install" else "removed"
+                print(f"  already {verb}: {previous[8]}", file=sys.stderr)
+            print(
+                f"Config files and {LOCKFILE_NAME} were NOT changed; run "
+                f"pio-lock restore {_env_flags(affected)} to return to the locked versions",
+                file=sys.stderr,
+            )
+            return False
+        done.append(command)
+    for env, url in dict.fromkeys((m.env, m.git_url) for m in plan.moves if m.git_url):
+        assert url is not None
+        _remove_stale_git_copies(project_dir, env, url)
+    return True
 
 
 def update(
@@ -2878,7 +3001,8 @@ def update(
     rewrites the version in the config file that declares it, in the style written (unless
     ``lock_only``). Versions outside the range are reported and left alone unless
     ``beyond_range``. Newer versions are installed with ``--no-save``, then the affected envs
-    are re-captured. ``dry_run`` prints what would change and touches nothing.
+    are re-captured. ``dry_run`` prints what would change and touches nothing. ``lib_filter``
+    limits the update to matching libraries (platforms are then left alone).
     """
     if not (project_dir / "platformio.ini").exists():
         print(f"Error: no platformio.ini in {project_dir}", file=sys.stderr)
@@ -2904,12 +3028,12 @@ def update(
         for entry in git_entries:
             _plan_git_library(plan, entry, tracker, github)
     elif git_entries:
-        print(
-            "Note: git dependencies not checked — no GITHUB_TOKEN set and gh CLI not found.",
-            file=sys.stderr,
-        )
-    _plan_platforms(plan, envs, lib_filter, github)
+        plan.unchecked.append("git dependencies")
+    if not lib_filter:
+        _plan_platforms(plan, envs, github)
 
+    for what in plan.unchecked:
+        print(_NO_GITHUB_NOTE.format(what=what), file=sys.stderr)
     for reason in plan.skipped:
         print(f"  Warning: {reason}; skipped", file=sys.stderr)
 
@@ -2917,55 +3041,58 @@ def update(
         print("All dependencies are up to date.")
         return 0
 
-    prefix = "would: " if dry_run else ""
     edits: dict[tuple[Path, Optional[str], str, str], _Edit] = {}
+    for move in plan.moves:
+        if move.edit:
+            key = (move.edit.path, move.edit.section, move.edit.old, move.edit.new)
+            edits.setdefault(key, move.edit)
+
+    def edit_line(edit: _Edit) -> str:
+        return f"    edited {_display_path(edit.path, project_dir)}: {edit.old} => {edit.new}"
+
+    prefix = "would: " if dry_run else ""
     printed: set[str] = set()
     for move in plan.moves:
         lines = [f"{move.name}: {move.old} -> {move.new}"]
-        if move.edit:
-            key = (move.edit.path, move.edit.section, move.edit.old, move.edit.new)
-            if key not in edits:
-                edits[key] = move.edit
-                shown = _display_path(move.edit.path, project_dir)
-                lines.append(f"    edited {shown}: {move.edit.old} => {move.edit.new}")
+        if dry_run and move.edit:
+            lines.append(edit_line(move.edit))
         for line in lines:
             if line not in printed:
                 printed.add(line)
                 print(f"{prefix}{line}")
     for line in plan.outside:
         print(line)
-    ini_changed = (
-        f"{prefix}platformio.ini changed — review and commit it with {LOCKFILE_NAME}"
-        if edits
-        else None
-    )
+    affected = list(dict.fromkeys(move.env for move in plan.moves))
+    notes = _shared_section_notes(project_dir, list(edits.values()), envs) if edits else []
     if dry_run or not plan.moves:
-        if ini_changed and plan.moves:
-            print(ini_changed)
+        for note in notes:
+            print(note)
+        if edits and plan.moves:
+            print(f"{prefix}platformio.ini changed — review and commit it with {LOCKFILE_NAME}")
         return 0
 
-    # Platforms are installed globally: once per spec, whichever env asks first.
-    commands: dict[tuple[str, ...], list[str]] = {}
-    for command in (c for move in plan.moves for c in move.commands):
-        install_key = tuple(command[7:] if "--platform" in command else command)
-        commands.setdefault(install_key, command)
-    for command in commands.values():
-        check = command[2] != "uninstall"  # the old version may already be gone
-        try:
-            run_cmd(list(command), cwd=str(project_dir), check=check)
-        except subprocess.CalledProcessError as exc:
-            print(f"Error: {' '.join(command)} failed: {exc}", file=sys.stderr)
-            return 1
-    _apply_edits(list(edits.values()))
+    if not _run_update_commands(project_dir, plan, affected):
+        return 1
+    applied = _apply_edits(list(edits.values()))
+    for edit in applied:
+        print(edit_line(edit))
+    for note in notes:
+        print(note)
 
-    affected = list(dict.fromkeys(move.env for move in plan.moves))
     platform_specs = _keep_platform_specs(project_dir, affected)
     platform_specs.update({m.env: m.platform_spec for m in plan.moves if m.platform_spec})
     rc = capture(project_dir, affected, platform_specs=platform_specs)
     if rc != 0:
+        changed = ", ".join(dict.fromkeys(_display_path(e.path, project_dir) for e in applied))
+        what = f"{changed} edited" if changed else "newer versions installed"
+        print(
+            f"Error: {what} but {LOCKFILE_NAME} was not updated; "
+            f"rerun pio-lock capture {_env_flags(affected)}",
+            file=sys.stderr,
+        )
         return rc
-    if ini_changed:
-        print(ini_changed)
+    if applied:
+        print(f"platformio.ini changed — review and commit it with {LOCKFILE_NAME}")
     return 0
 
 

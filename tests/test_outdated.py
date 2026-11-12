@@ -6,6 +6,7 @@ These mock PlatformIO's internal APIs so they run without PIO installed.
 from __future__ import annotations
 
 import json
+import subprocess
 from typing import Any, Optional
 from unittest.mock import MagicMock
 
@@ -128,10 +129,11 @@ def mock_pio(monkeypatch, tmp_path, mock_git_commands):
     from tests.fakes import FakePioAdapter
 
     captured: list[list[str]] = []
+    capture_rc = {"rc": 0}
 
     def fake_capture(project_dir, envs, output_path=None, platform_specs=None):
         captured.append(list(envs))
-        return 0
+        return capture_rc["rc"]
 
     monkeypatch.setattr(pio_lock, "capture", fake_capture)
     adapter = FakePioAdapter(platforms={})
@@ -171,6 +173,21 @@ def mock_pio(monkeypatch, tmp_path, mock_git_commands):
     class Builder:
         run_log = mock_git_commands
         captured_envs = captured
+
+        def fail_capture(self) -> None:
+            capture_rc["rc"] = 1
+
+        def fail_command(self, needle: str) -> None:
+            """Make the ``pio`` command containing ``needle`` fail (after logging it)."""
+            run = pio_lock._run_cmd
+
+            def failing(args, cwd=None, check=True):
+                result = run(args, cwd=cwd, check=check)
+                if needle in args:
+                    raise subprocess.CalledProcessError(1, args)
+                return result
+
+            monkeypatch.setattr(pio_lock, "_run_cmd", failing)
 
         def pio_commands(self) -> list[list[str]]:
             return [args for args in self.run_log if args[:1] == ["pio"]]
@@ -708,6 +725,98 @@ class TestUpdate:
         out = capsys.readouterr().out
         assert "r: v1.2.0 -> v1.3.0" in out
         assert f"r: v2.0.0 is outside {url}#v1.2.0; rerun with --beyond-range" in out
+
+    # ── fix round 1 ──
+
+    def test_update_install_failure_reports_and_changes_nothing(self, tmp_path, mock_pio, capsys):
+        ini = "[env:test]\nlib_deps =\n    acme/Foo @ ^1.0.0\n    acme/Bar @ ^1.0.0\n"
+        (tmp_path / "platformio.ini").write_text(ini)
+        self._foo(mock_pio)
+        mock_pio.add_lib(
+            "test", "acme/Bar @ ^1.0.0", "Bar", "1.0.0", latest="1.1.0", wanted="1.1.0"
+        )
+        mock_pio.fail_command("acme/Bar @ ==1.1.0")
+        assert pio_lock.update(tmp_path, ["test"]) == 1
+        assert (tmp_path / "platformio.ini").read_text() == ini
+        assert mock_pio.captured_envs == []
+        captured = capsys.readouterr()
+        assert "edited" not in captured.out
+        assert "already installed: acme/Foo @ ==1.2.0" in captured.err
+        assert "already removed: acme/Foo @ ==1.0.0" in captured.err
+        assert "were NOT changed" in captured.err
+        assert "pio-lock restore -e test" in captured.err
+
+    def test_update_capture_failure_after_edits(self, tmp_path, mock_pio, capsys):
+        (tmp_path / "platformio.ini").write_text(self.INI)
+        self._foo(mock_pio)
+        mock_pio.fail_capture()
+        assert pio_lock.update(tmp_path, ["test"]) == 1
+        assert "acme/Foo @ ^1.2.0" in (tmp_path / "platformio.ini").read_text()
+        err = capsys.readouterr().err
+        assert "platformio.ini edited but pio.lock.json was not updated" in err
+        assert "pio-lock capture -e test" in err
+
+    def test_update_names_other_envs_sharing_an_edited_spec(self, tmp_path, mock_pio, capsys):
+        block = "lib_deps =\n    acme/Foo @ ^1.0.0\n"
+        ini = f"[env:dev]\n{block}[env:prod]\n{block}"
+        (tmp_path / "platformio.ini").write_text(ini)
+        mock_pio.add_lib(
+            "dev", "acme/Foo @ ^1.0.0", "Foo", "1.0.0", latest="1.2.0", wanted="1.2.0"
+        )
+        assert pio_lock.update(tmp_path, ["dev"]) == 0
+        assert mock_pio.captured_envs == [["dev"]]
+        out = capsys.readouterr().out
+        assert "[env:prod] also applies to env prod; run pio-lock update -e prod" in out
+        assert "env dev;" not in out
+
+    def test_update_partial_version_is_a_range(self, tmp_path, mock_pio, capsys):
+        """``Foo @ 2`` allows any 2.x: the lock moves, the spec isn't narrowed to 2.3.0."""
+        ini = "[env:test]\nlib_deps =\n    acme/Foo @ 2\n"
+        (tmp_path / "platformio.ini").write_text(ini)
+        mock_pio.add_lib("test", "acme/Foo @ 2", "Foo", "2.0.0", latest="2.3.0", wanted="2.3.0")
+        assert pio_lock.update(tmp_path, ["test"]) == 0
+        assert (tmp_path / "platformio.ini").read_text() == ini
+        assert self._install(tmp_path, "--library", "acme/Foo @ ==2.3.0") in (
+            mock_pio.pio_commands()
+        )
+
+    def test_update_beyond_range_unrewritable_spec_needs_hand_edit(
+        self, tmp_path, mock_pio, capsys
+    ):
+        ini = "[env:test]\nlib_deps =\n    acme/Foo @ <2.0\n"
+        (tmp_path / "platformio.ini").write_text(ini)
+        self._foo(mock_pio, wanted="1.0.0", latest="2.1.0", spec="acme/Foo @ <2.0")
+        assert pio_lock.update(tmp_path, ["test"], beyond_range=True) == 0
+        assert (tmp_path / "platformio.ini").read_text() == ini
+        assert mock_pio.pio_commands() == []
+        assert "Foo: 2.1.0 is outside acme/Foo @ <2.0; edit the ini by hand" in (
+            capsys.readouterr().out
+        )
+
+    def test_update_git_move_removes_stale_copy(
+        self, tmp_path, mock_pio, monkeypatch, make_git_lib
+    ):
+        url = "https://github.com/o/r.git"
+        (tmp_path / "platformio.ini").write_text(f"[env:test]\nlib_deps =\n    {url}#dev\n")
+        mock_pio.add_lib("test", f"{url}#dev", "r", f"1.0.0+sha.{LOCKED}", external=True)
+        make_git_lib("test", "r", sha=HEAD, url=url)
+        stale = make_git_lib("test", "r@src-0123", sha=LOCKED, url=url)
+        other = make_git_lib("test", "x@src-4567", sha=LOCKED, url="https://github.com/o/x.git")
+        lock_lib = {"name": "r", "type": "git", "url": url, "sha": LOCKED, "ref": "dev"}
+        lock = {"lockfile_version": 2, "envs": {"test": {"libraries": [lock_lib]}}}
+        (tmp_path / "pio.lock.json").write_text(json.dumps(lock))
+        github = FakeGitHubClient({"repos/o/r/branches/dev": {"commit": {"sha": HEAD}}})
+        monkeypatch.setattr(pio_lock, "_create_github_client_fn", lambda: github)
+
+        assert pio_lock.update(tmp_path, ["test"]) == 0
+        uninstalls = [c for c in mock_pio.pio_commands() if c[2] == "uninstall"]
+        assert uninstalls == [
+            [
+                "pio", "pkg", "uninstall", "-d", str(tmp_path), "-e", "test",
+                "--library", f"file://{stale}", "--no-save",
+            ]
+        ]  # fmt: skip
+        assert other.exists()
 
 
 # ── Tests for ConfigSourceTracker ─────────────────────────────────────────────
