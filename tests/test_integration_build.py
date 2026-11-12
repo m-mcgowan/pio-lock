@@ -739,3 +739,95 @@ def test_interactive_build_continue_under_pty(tmp_path: Path) -> None:
     assert _PROMPT in out, out
     assert rc == 0, out
     assert "SUCCESS" in out
+
+
+# ── Duplicate library copies ─────────────────────────────────────────────────
+
+
+def _install_fake_copy(p: Path, dir_name: str, version: str, function: str) -> None:
+    """A registry-style installed copy of ``piolocktest/dupdemo`` (no network needed)."""
+    lib = p / ".pio" / "libdeps" / "native" / dir_name
+    (lib / "src").mkdir(parents=True)
+    piopm = {
+        "type": "library",
+        "name": "dupdemo",
+        "version": version,
+        "spec": {"owner": "piolocktest", "id": None, "name": "dupdemo", "requirements": None},
+    }
+    (lib / ".piopm").write_text(json.dumps(piopm))
+    (lib / "library.json").write_text(json.dumps({"name": "dupdemo", "version": version}))
+    (lib / "src" / f"{function}.c").write_text(f"int {function}(void) {{ return 1; }}\n")
+
+
+def _duplicates_project(tmp_path: Path, lib_deps: list[str], main: str) -> Path:
+    """dupdemo 1.1.0 (``dupdemo/``) and 1.0.0 (``dupdemo@1.0.0/``) installed side by side."""
+    p = make_native_project(tmp_path / "proj", "[env:native]\nplatform = native\n")
+    lib = piolock_lib(p)
+    (p / ".gitignore").write_text(".pio/\nbuild_snapshot.json\n")
+    deps = "".join(f"\n    {spec}" for spec in lib_deps)
+    (p / "platformio.ini").write_text(
+        f"[env:native]\nplatform = native\nextra_scripts = pre:{lib}/pio_lock.py\n"
+        f"lib_deps ={deps}\n"
+    )
+    (p / "src" / "main.cpp").write_text(main)
+    _install_fake_copy(p, "dupdemo", "1.1.0", "dupdemo_new")
+    _install_fake_copy(p, "dupdemo@1.0.0", "1.0.0", "dupdemo_old")
+    _commit_and_snapshot(p)
+    return p
+
+
+@requires_pio
+def test_build_fails_in_release_when_two_copies_are_linked(tmp_path: Path) -> None:
+    # Two lib_deps specs (in real projects often from different ini files) select one copy
+    # each, so PlatformIO builds and links both. (A bare "1.0.0" in a library.json does not:
+    # PlatformIO's LDF ignores a version without an operator when picking the copy.)
+    p = _duplicates_project(
+        tmp_path,
+        ["piolocktest/dupdemo @ 1.1.0", "piolocktest/dupdemo @ 1.0.0"],
+        'extern "C" int dupdemo_new(void);\nextern "C" int dupdemo_old(void);\n'
+        "int main() { return dupdemo_new() + dupdemo_old(); }\n",
+    )
+    linked = (
+        "linked duplicate copies of 'dupdemo': dupdemo, dupdemo@1.0.0 — both are built "
+        "into this image; make the requirements agree"
+    )
+
+    released = run_pio(p, "run", "-e", "native", env=_RELEASE)
+    assert released.returncode != 0, released.stdout
+    assert f"ERROR: {linked}" in released.stdout
+    assert "build stopped" in released.stdout
+
+    warned = run_pio(p, "run", "-e", "native", env={**_RELEASE, "PIO_LOCK_DRIFT": "warn"})
+    assert warned.returncode == 0, warned.stdout
+    assert f"WARNING: {linked}" in warned.stdout
+
+    # A program that already exists (the warn build above) is still checked on relink.
+    (p / "src" / "main.cpp").write_text(
+        'extern "C" int dupdemo_new(void);\nextern "C" int dupdemo_old(void);\n'
+        "int main() { return dupdemo_new() - dupdemo_old(); }\n"
+    )
+    _commit_and_snapshot(p)
+    relinked = run_pio(p, "run", "-e", "native", env=_RELEASE)
+    assert relinked.returncode != 0, relinked.stdout
+    assert f"ERROR: {linked}" in relinked.stdout
+
+
+@requires_pio
+def test_build_passes_when_only_one_installed_copy_is_linked(tmp_path: Path) -> None:
+    p = _duplicates_project(
+        tmp_path,
+        ["piolocktest/dupdemo @ 1.1.0"],
+        'extern "C" int dupdemo_new(void);\nint main() { return dupdemo_new(); }\n',
+    )
+    cli = [sys.executable, str(REPO_ROOT / "pio_lock.py"), "-d", str(p)]
+    captured = _run_cli([*cli, "capture", "-e", "native"])
+    assert captured.returncode == 0, captured.stdout
+    assert "Warning: duplicate copies of 'dupdemo'" in captured.stdout
+    _commit_and_snapshot(p)
+
+    released = run_pio(p, "run", "-e", "native", env=_RELEASE)
+    assert released.returncode == 0, released.stdout
+    assert "WARNING: duplicate copies of 'dupdemo': dupdemo (1.1.0; requested by lib_deps: " in (
+        released.stdout
+    )
+    assert "linked duplicate" not in released.stdout

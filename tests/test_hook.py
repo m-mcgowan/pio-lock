@@ -19,6 +19,8 @@ class FakeEnv:
         self.targets: list[str] = []
         self.vars: dict[str, Any] = {}
         self.options: dict[str, Any] = {}
+        self.pre_actions: list[tuple[str, Any]] = []
+        self.lib_builders: list[Any] = []
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.vars.get(key, default)
@@ -37,6 +39,12 @@ class FakeEnv:
 
     def AddCustomTarget(self, name: str, *args: Any, **kwargs: Any) -> None:  # noqa: N802
         self.targets.append(name)
+
+    def AddPreAction(self, target: str, action: Any) -> None:  # noqa: N802
+        self.pre_actions.append((target, action))
+
+    def GetLibBuilders(self) -> list[Any]:  # noqa: N802
+        return self.lib_builders
 
 
 @pytest.fixture
@@ -524,3 +532,134 @@ def test_register_runs_build_checks_for_current_env(
     )
     pio_lock.register_pio_targets(env)
     assert calls == [(project, "native")]
+
+
+# ── Linked duplicates (pre-link check) ───────────────────────────────────────
+
+
+class FakeLibBuilder:
+    """The slice of PlatformIO's LibBuilderBase the pre-link check reads."""
+
+    def __init__(self, path: Path, name: str, is_built: bool) -> None:
+        self.path = str(path)
+        self.name = name
+        self.is_built = is_built
+
+
+@pytest.fixture
+def linked(
+    tmp_project: Path,
+    make_registry_lib: Any,
+    mock_git_commands: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    """Two installed copies of X (3.1.15 and 3.1.13); builders for both, neither built yet."""
+    monkeypatch.delenv("PIO_RELEASE_BUILD", raising=False)
+    monkeypatch.delenv("PIO_LOCK_DRIFT", raising=False)
+    monkeypatch.setattr(pio_lock, "_requested_targets", lambda _env: set())
+    new = make_registry_lib("testenv", "X", "3.1.15", project_dir=tmp_project)
+    old = make_registry_lib("testenv", "X", "3.1.13", project_dir=tmp_project, dir_name="X@3.1.13")
+    env = FakeEnv()
+    env.lib_builders = [FakeLibBuilder(new, "X", False), FakeLibBuilder(old, "X", False)]
+
+    class Linked:
+        project = tmp_project
+
+        def __init__(self) -> None:
+            self.env = env
+
+        def build(self, *, new_built: bool, old_built: bool) -> int:
+            env.lib_builders[0].is_built = new_built
+            env.lib_builders[1].is_built = old_built
+            return pio_lock.link_checks(tmp_project, "testenv", env)
+
+    return Linked()
+
+
+def test_one_built_copy_is_not_a_linked_duplicate(linked: Any, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
+    assert linked.build(new_built=True, old_built=False) == 0
+    assert "linked duplicate" not in capsys.readouterr().out
+
+
+def test_linked_duplicates_fail_release_and_warn_otherwise(
+    linked: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    assert linked.build(new_built=True, old_built=True) == 0
+    out = capsys.readouterr().out
+    assert (
+        "WARNING: linked duplicate copies of 'X': X, X@3.1.13 — both are built into this image; "
+        "make the requirements agree"
+    ) in out
+
+    monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
+    assert linked.build(new_built=True, old_built=True) == 1
+    captured = capsys.readouterr()
+    assert "ERROR: linked duplicate copies of 'X': X, X@3.1.13" in captured.out
+    assert "build stopped" in captured.err
+
+
+@pytest.mark.parametrize("via", ["env_var", "ini_option"])
+def test_linked_duplicates_policy_warn(
+    linked: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any, via: str
+) -> None:
+    monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
+    if via == "env_var":
+        monkeypatch.setenv("PIO_LOCK_DRIFT", "warn")
+    else:
+        linked.env.options["custom_pio_lock_drift"] = "warn"
+    assert linked.build(new_built=True, old_built=True) == 0
+    assert "WARNING: linked duplicate copies of 'X'" in capsys.readouterr().out
+
+
+def test_linked_duplicates_name_the_exact_library_pin(
+    linked: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    board = linked.project / "lib" / "board_support"
+    board.mkdir(parents=True)
+    (board / "library.json").write_text(
+        '{"name": "board_support", "dependencies": {"X": "3.1.13"}}'
+    )
+    assert linked.build(new_built=True, old_built=True) == 0
+    assert (
+        "lib/board_support pins 'X' to 3.1.13 — prefer a range (e.g. ^3.1.0) in library.json"
+        in capsys.readouterr().out
+    )
+
+
+def test_linked_check_degrades_without_lib_builder_api(
+    linked: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
+
+    class Opaque:
+        path = "/somewhere"
+
+    linked.env.lib_builders = [Opaque()]
+    assert pio_lock.link_checks(linked.project, "testenv", linked.env) == 0
+    assert "WARNING: linked duplicates not checked" in capsys.readouterr().out
+
+
+def test_register_adds_prelink_check_except_for_lock_targets(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pio_lock, "build_checks", lambda *a: None)
+    monkeypatch.setattr(pio_lock, "snapshot_auto_manage", lambda *a, **k: None)
+    calls: list[str] = []
+    monkeypatch.setattr(pio_lock, "link_checks", lambda p, name, _env: calls.append(name) or 0)
+    subst = {"$PROJECT_DIR": str(project), "$PIOENV": "native"}
+
+    monkeypatch.setattr(pio_lock, "_requested_targets", lambda _env: set())
+    env = FakeEnv()
+    monkeypatch.setattr(env, "subst", lambda v: subst.get(v, v))
+    pio_lock.register_pio_targets(env)
+    assert [t for t, _ in env.pre_actions] == ["$BUILD_DIR/${PROGNAME}${PROGSUFFIX}"]
+    assert env.pre_actions[0][1](target=[], source=[], env=env) == 0
+    assert calls == ["native"]
+
+    monkeypatch.setattr(pio_lock, "_requested_targets", lambda _env: {"lock-check"})
+    monkeypatch.setattr(pio_lock, "_already_loaded", lambda _env: False)
+    other = FakeEnv()
+    monkeypatch.setattr(other, "subst", lambda v: subst.get(v, v))
+    pio_lock.register_pio_targets(other)
+    assert other.pre_actions == []

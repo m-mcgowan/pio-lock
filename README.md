@@ -277,6 +277,19 @@ custom_pio_lock_drift = warn
 
 From the command line, `pio-lock check --warn-only` (or `PIO_LOCK_DRIFT=warn pio-lock check …`) reports drift as warnings and exits 0.
 
+## Duplicate library copies
+
+PlatformIO can install a library more than once in `.pio/libdeps/<env>/` — `SparkFun u-blox GNSS v3/` next to `SparkFun u-blox GNSS v3@3.1.13/`, or a git library next to `<name>@src-<hash>/` checkouts. pio-lock tells two situations apart:
+
+- **Installed duplicates** — several copies sit in libdeps, but the build uses one. pio-lock records every copy (with its `dir`) and prints a warning in `capture`, `restore`, `check` and the build; it never fails anything. `check` doesn't compare a duplicated library's lock entries against an arbitrary copy, so the warning replaces a misleading "expected …".
+- **Linked duplicates** — two or more copies are built into the same image. In C/C++ this is a real fault: each library becomes its own `.a` archive, and all of them share one symbol namespace, so the image either breaks the one-definition rule or silently mixes functions from different versions. Just before linking, pio-lock checks the libraries PlatformIO built; linked duplicates fail a release build (unless `PIO_LOCK_DRIFT=warn` / `custom_pio_lock_drift = warn`) and warn otherwise.
+
+```text
+WARNING: duplicate copies of 'SparkFun u-blox GNSS v3': SparkFun u-blox GNSS v3 (3.1.15; requested by lib_deps: sparkfun/SparkFun u-blox GNSS v3 @ ^3.1.7), SparkFun u-blox GNSS v3@3.1.13 (3.1.13; requested by lib/board_support: SparkFun u-blox GNSS v3@3.1.13); make the requirements agree so only one copy is installed; lib/board_support pins 'SparkFun u-blox GNSS v3' to 3.1.13 — prefer a range (e.g. ^3.1.0) in library.json
+```
+
+To resolve either, make the requirements agree so only one copy is installed, then delete `.pio/libdeps/<env>` (or the extra directories) and reinstall. The usual cause is a library pinning a dependency exactly — `"version": "3.1.13"`, `==3.1.13` or a git `#<sha>`/tag in its `library.json` — while the project or another library asks for a range. Libraries should declare ranges (`^3.1.0`) and leave exact versions to the project's lock; the report names the library that pins.
+
 ## Updating
 
 `pio-lock outdated -e <env>` reports what's newer, read-only:
@@ -353,7 +366,7 @@ pio-lock init
 | `init` | Add `pio.lock.ini` to `[platformio] extra_configs` (`--dry-run` previews) |
 | `snapshot-capture`, `snapshot-check`, `snapshot-clear`, `snapshot-print` | Manage `build_snapshot.json` |
 
-All commands take `-d, --project-dir` (default: the current directory).
+All commands take `-d, --project-dir` (default: the current directory), before or after the command name: `pio-lock -d app check -e esp32` and `pio-lock check -e esp32 -d app` are the same.
 
 ### PlatformIO targets
 
@@ -439,7 +452,8 @@ On every build pio-lock sets `SOURCE_DATE_EPOCH` from `build_snapshot.json`, so 
           "name": "Blues Wireless Notecard",
           "type": "registry",
           "version": "1.8.4",
-          "owner": "blues"
+          "owner": "blues",
+          "dir": "Blues Wireless Notecard"
         },
         {
           "name": "esp-nimble-cpp",
@@ -447,12 +461,14 @@ On every build pio-lock sets `SOURCE_DATE_EPOCH` from `build_snapshot.json`, so 
           "url": "https://github.com/user/esp-nimble-cpp.git",
           "sha": "32e7ca2d2d387d74eaeac09751049778faea4040",
           "ref": "main",
-          "ref_type": "branch"
+          "ref_type": "branch",
+          "dir": "esp-nimble-cpp"
         },
         {
           "name": "my-local-lib",
           "type": "local",
-          "path": "file://lib/my-local-lib"
+          "path": "file://lib/my-local-lib",
+          "dir": "my-local-lib"
         }
       ]
     }
@@ -463,6 +479,7 @@ On every build pio-lock sets `SOURCE_DATE_EPOCH` from `build_snapshot.json`, so 
 - `platform.spec` and `platform.platform_packages_spec` are what you wrote in `platformio.ini` (ignoring `pio.lock.ini`); a change to either makes the env's lock stale.
 - `platform.src_url` / `packages[].src_url` are set for git and URL sources.
 - Git libraries record the requested `ref` and its `ref_type` (`branch`, `tag`, `sha`, or `default` for no ref).
+- `dir` is the library's directory in `.pio/libdeps/<env>/` (including `@<version>` and `@src-<hash>` copies); `check` and `restore` compare an entry against that directory when it exists. Entries without `dir` (older locks) are matched by name or git URL.
 
 Format v1 (0.3.x and earlier) had top-level `platform_url` and `global_packages` instead of per-env `platform`. pio-lock still reads v1 files — libraries work as before, platform checks are skipped with a hint — and `capture` always writes v2. Re-run `capture` to upgrade.
 

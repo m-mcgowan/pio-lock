@@ -31,9 +31,11 @@ def make_registry_lib(tmp_path: Path):
         owner: str = "testowner",
         *,
         project_dir: Path | None = None,
+        dir_name: str | None = None,
     ) -> Path:
+        """``dir_name`` (default ``name``) names the directory, e.g. ``X@3.1.13``."""
         base = project_dir or tmp_path
-        lib_dir = base / ".pio" / "libdeps" / env / name
+        lib_dir = base / ".pio" / "libdeps" / env / (dir_name or name)
         lib_dir.mkdir(parents=True, exist_ok=True)
         piopm: dict[str, Any] = {
             "type": "library",
@@ -60,6 +62,7 @@ def make_git_lib(tmp_path: Path):
         project_dir: Path | None = None,
         library_json_name: str | None = None,
     ) -> Path:
+        """``name`` is the directory name (e.g. ``X@src-abc``)."""
         base = project_dir or tmp_path
         lib_dir = base / ".pio" / "libdeps" / env / name
         lib_dir.mkdir(parents=True, exist_ok=True)

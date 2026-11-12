@@ -539,6 +539,35 @@ class TestCLI:
         )
         assert rc == 0
 
+    @staticmethod
+    def _locked_lib(tmp_project, make_registry_lib):
+        make_registry_lib("testenv", "Lib", "1.0.0", project_dir=tmp_project)
+        write_lockfile(
+            tmp_project,
+            {
+                "testenv": [
+                    {"name": "Lib", "type": "registry", "version": "1.0.0", "owner": "testowner"},
+                ],
+            },
+        )
+
+    def test_project_dir_after_subcommand(
+        self, tmp_project, make_registry_lib, mock_git_commands, monkeypatch, tmp_path_factory
+    ):
+        self._locked_lib(tmp_project, make_registry_lib)
+        monkeypatch.chdir(tmp_path_factory.mktemp("elsewhere"))
+        assert pio_lock.main(["check", "-e", "testenv", "-d", str(tmp_project)]) == 0
+        assert pio_lock.main(["check", "--project-dir", str(tmp_project), "-e", "testenv"]) == 0
+
+    def test_project_dir_before_subcommand_still_works(
+        self, tmp_project, make_registry_lib, mock_git_commands, monkeypatch, tmp_path_factory
+    ):
+        self._locked_lib(tmp_project, make_registry_lib)
+        monkeypatch.chdir(tmp_path_factory.mktemp("elsewhere"))
+        assert pio_lock.main(["-d", str(tmp_project), "check", "-e", "testenv"]) == 0
+        # Without -d anywhere the current directory is used (no lockfile there).
+        assert pio_lock.main(["check", "-e", "testenv"]) == 1
+
 
 class TestUpdateCLI:
     """update applies by default; --apply is a deprecated no-op."""

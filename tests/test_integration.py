@@ -345,20 +345,19 @@ class TestGitLibCapture:
 
 @skip_no_pio
 class TestShadowCopyHandling:
-    """Tests that PIO shadow copy directories are skipped."""
+    """PIO ``@src-`` copies are recorded (with their dir) and reported as duplicates."""
 
-    def test_shadow_copy_not_captured(self, tmp_path):
+    def test_shadow_copy_captured_and_reported(self, tmp_path):
         ini = "[env:native]\nplatform = native\n"
         (tmp_path / "platformio.ini").write_text(ini)
         libdeps = tmp_path / ".pio" / "libdeps" / "native"
         libdeps.mkdir(parents=True)
 
-        # Real library
         real_dir = libdeps / "NimBLE-Arduino"
         real_dir.mkdir()
         (real_dir / ".piopm").write_text(_make_piopm("NimBLE-Arduino", "1.4.1", "h2zero"))
 
-        # Shadow copy (should be skipped)
+        # A second installed copy: recorded, and reported as a duplicate
         shadow_dir = libdeps / "NimBLE-Arduino@src-abc123"
         shadow_dir.mkdir()
         (shadow_dir / ".piopm").write_text(_make_piopm("NimBLE-Arduino", "1.4.1", "h2zero"))
@@ -370,10 +369,10 @@ class TestShadowCopyHandling:
             text=True,
         )
         assert result.returncode == 0, result.stderr
+        assert "Warning: duplicate copies of 'NimBLE-Arduino'" in result.stderr
         data = json.loads((tmp_path / "pio.lock.json").read_text())
         libs = data["envs"]["native"]["libraries"]
-        names = [lib["name"] for lib in libs]
-        assert names.count("NimBLE-Arduino") == 1
+        assert [lib["dir"] for lib in libs] == ["NimBLE-Arduino", "NimBLE-Arduino@src-abc123"]
 
 
 @skip_no_pio

@@ -62,6 +62,14 @@ set up with a `lib_deps` line alone, and records the git ref you asked for. See 
 - `capture -e <env>` updates only that env's entries and prunes envs no longer in
   `platformio.ini`; pio-lock itself is left out of the library list. If PlatformIO's internals
   are incompatible, the previous platform lock is kept with a warning.
+- Duplicate library copies are reported. Installed duplicates (several copies of one library in
+  `.pio/libdeps/<env>`, matched by manifest name or git URL) warn in `capture`, `restore`,
+  `check` and the build, with who requested each copy and which `library.json` pins a
+  dependency exactly. Linked duplicates (two copies built into one image) are checked just
+  before linking and fail a release build under the drift policy. See the README's "Duplicate
+  library copies".
+- Each locked library records its libdeps directory as `dir`.
+- `-d/--project-dir` is accepted after the subcommand as well as before it.
 - Integration tests build real projects on the `native` platform; CI tests PlatformIO 6.1.18,
   6.2.x and latest, plus a weekly run. `make test-pio PIO=<version>` runs them locally against
   any PlatformIO version in isolated directories.
@@ -73,6 +81,12 @@ set up with a `lib_deps` line alone, and records the git ref you asked for. See 
   `build_snapshot.json` first, which hid the staleness `snapshot-check` exists to report.
 - An unparsable `platformio.ini` gives an error message instead of a traceback.
 - `capture` no longer crashes when the `pio` CLI isn't on `PATH`.
+- `check` compared every lock entry of a library installed twice against the first directory
+  found, giving a permanent `DRIFT: … expected <version>` (or a SHA that depended on directory
+  order); duplicated libraries now get the duplicate warning instead, and other entries are
+  compared against their recorded `dir`.
+- `capture` skipped every `<name>@src-<hash>` directory, so a git library installed only there
+  was missing from the lock; these checkouts are now recorded.
 
 ### Deprecated
 - The `lib_deps` + `extra_scripts = pre:${PROJECT_LIBDEPS_DIR}/${PIOENV}/pio-lock/pio_lock.py`

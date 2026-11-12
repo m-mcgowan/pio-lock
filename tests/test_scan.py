@@ -19,6 +19,7 @@ class TestScanEnvLibraries:
             "type": "registry",
             "version": "2.3.4",
             "owner": "acme",
+            "dir": "MyLib",
         }
 
     def test_registry_library_without_owner(
@@ -49,6 +50,7 @@ class TestScanEnvLibraries:
             "type": "git",
             "url": "https://github.com/test/git-lib.git",
             "sha": "deadbeef" * 5,
+            "dir": "git-lib",
         }
 
     def test_git_library_with_library_json(self, tmp_project, make_git_lib, mock_git_commands):
@@ -71,14 +73,24 @@ class TestScanEnvLibraries:
             "name": "LocalLib",
             "type": "local",
             "path": "file://lib/local",
+            "dir": "LocalLib",
         }
 
-    def test_skips_shadow_copies(self, tmp_project, make_registry_lib, mock_git_commands):
-        make_registry_lib("testenv", "NimBLE@src-abc123", project_dir=tmp_project)
+    def test_records_src_copies_and_skips_unmanaged_ones(
+        self, tmp_project, make_registry_lib, mock_git_commands
+    ):
+        """``@src-`` copies are installed libraries too (and are reported as duplicates);
+        only a directory with neither .piopm nor .git is skipped."""
+        make_registry_lib(
+            "testenv", "NimBLE", project_dir=tmp_project, dir_name="NimBLE@src-abc123"
+        )
         make_registry_lib("testenv", "RealLib", project_dir=tmp_project)
+        (tmp_project / ".pio" / "libdeps" / "testenv" / "Junk@src-ffff").mkdir()
         libs = pio_lock.scan_env_libraries(tmp_project, "testenv")
-        assert len(libs) == 1
-        assert libs[0]["name"] == "RealLib"
+        assert [(lib["name"], lib["dir"]) for lib in libs] == [
+            ("NimBLE", "NimBLE@src-abc123"),
+            ("RealLib", "RealLib"),
+        ]
 
     def test_skips_non_directories(self, tmp_project, mock_git_commands):
         libdeps = tmp_project / ".pio" / "libdeps" / "testenv"

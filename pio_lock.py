@@ -35,7 +35,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -433,15 +433,45 @@ def scan_env_libraries(project_dir: Path, env_name: str) -> list[dict[str, Any]]
 
         name = lib_dir.name
 
-        # Skip PIO shadow copies (e.g. NimBLE-Arduino@src-abc123)
-        if "@src-" in name:
+        # A detached ``<name>@src-<hash>`` copy is recorded like any other installed library
+        # (duplicates are reported separately); one PlatformIO doesn't manage is skipped.
+        if "@src-" in name and not _is_managed_library_dir(lib_dir):
             continue
 
         entry = _scan_single_library(lib_dir, name)
         if entry is not None:
+            entry["dir"] = name
             libraries.append(entry)
 
     return libraries
+
+
+def _is_managed_library_dir(lib_dir: Path) -> bool:
+    """Whether a libdeps directory is a library PlatformIO installed (.piopm or a checkout)."""
+    return (lib_dir / ".piopm").exists() or (lib_dir / ".git").exists()
+
+
+def _dir_library_name(dir_name: str) -> str:
+    """The library name a libdeps directory stands for: ``X@3.1.13`` / ``X@src-abc`` -> ``X``."""
+    return dir_name.split("@", 1)[0] or dir_name
+
+
+def _manifest_name(lib_dir: Path) -> Optional[str]:
+    """The ``name`` from library.json, else library.properties; None when neither has one."""
+    try:
+        data = json.loads((lib_dir / "library.json").read_text())
+        if isinstance(data, dict) and data.get("name"):
+            return str(data["name"])
+    except (OSError, ValueError):
+        pass
+    try:
+        for line in (lib_dir / "library.properties").read_text().splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip() == "name" and value.strip():
+                return value.strip()
+    except (OSError, UnicodeDecodeError):
+        pass
+    return None
 
 
 def _scan_single_library(lib_dir: Path, name: str) -> Optional[dict[str, Any]]:
@@ -479,12 +509,12 @@ def _scan_single_library(lib_dir: Path, name: str) -> Optional[dict[str, Any]]:
         sha = get_git_sha(lib_dir)
         url = get_git_remote_url(lib_dir)
 
-        display_name = name
+        display_name = _dir_library_name(name)
         lib_json_path = lib_dir / "library.json"
         if lib_json_path.exists():
             try:
                 lib_data = json.loads(lib_json_path.read_text())
-                display_name = lib_data.get("name", name)
+                display_name = lib_data.get("name", display_name)
             except json.JSONDecodeError:
                 pass
 
@@ -508,14 +538,24 @@ def _scan_single_library(lib_dir: Path, name: str) -> Optional[dict[str, Any]]:
 def is_installed_at_locked_version(
     project_dir: Path, env_name: str, lib_entry: dict[str, Any]
 ) -> bool:
-    """Check if a library is already installed at the locked version."""
+    """Check if a library is already installed at the locked version.
+
+    An entry with a ``dir`` (lockfiles from 0.4.0) is compared against that directory only
+    when it exists; otherwise the first directory with the entry's name (registry) or URL
+    (git) is used.
+    """
     libdeps_dir = project_dir / ".pio" / "libdeps" / env_name
 
     if not libdeps_dir.is_dir():
         return False
 
+    lib_dirs = list(libdeps_dir.iterdir())
+    locked_dir = libdeps_dir / str(lib_entry.get("dir") or "")
+    if lib_entry.get("dir") and locked_dir.is_dir():
+        lib_dirs = [locked_dir]
+
     if lib_entry["type"] == "registry":
-        for lib_dir in libdeps_dir.iterdir():
+        for lib_dir in lib_dirs:
             if not lib_dir.is_dir():
                 continue
             piopm = lib_dir / ".piopm"
@@ -529,7 +569,7 @@ def is_installed_at_locked_version(
         return False
 
     elif lib_entry["type"] == "git":
-        for lib_dir in libdeps_dir.iterdir():
+        for lib_dir in lib_dirs:
             if not lib_dir.is_dir():
                 continue
             if not ((lib_dir / ".git").exists() or (lib_dir / ".git").is_file()):
@@ -689,6 +729,311 @@ def _annotate_git_refs(libraries: list[dict[str, Any]], lib_deps: Any) -> None:
         lib["ref_type"] = _classify_git_ref(ref)
 
 
+# ── Duplicate library copies ─────────────────────────────────────────────────
+
+
+@dataclass
+class LibraryCopy:
+    """One installed (or built) copy of a library.
+
+    ``requested_by`` is best effort: ``lib_deps: <spec>`` for the env's lib_deps and
+    ``<library dir>: <spec>`` for another library's library.json dependency. ``exact_pins``
+    holds the (library dir, requirement) pairs where a library.json pins this copy exactly.
+    """
+
+    dir: str
+    name: str
+    type: str  # "registry" | "git" | "local"
+    version: Optional[str] = None
+    sha: Optional[str] = None
+    url: Optional[str] = None
+    requested_by: list[str] = field(default_factory=list)
+    exact_pins: list[tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class _Requirement:
+    """A request for a library: from the env's lib_deps (source None) or a library.json."""
+
+    source: Optional[str]
+    spec: str
+    name: Optional[str]
+    url: Optional[str]
+    requirement: Optional[str]  # semver requirement, or the git ref when ``url`` is set
+
+    @property
+    def exact(self) -> bool:
+        if self.url:
+            return _classify_git_ref(self.requirement) in ("sha", "tag")
+        return _requirement_kind(self.requirement) == "exact"
+
+    def label(self) -> str:
+        return f"{self.source or 'lib_deps'}: {self.spec}"
+
+
+def _library_copy(lib_dir: Path, dir_label: Optional[str] = None) -> Optional[LibraryCopy]:
+    """Describe one library directory; None when it is neither PlatformIO-managed nor a
+    library with a manifest."""
+    label = dir_label or lib_dir.name
+    fallback = _manifest_name(lib_dir) or _dir_library_name(lib_dir.name)
+    piopm = lib_dir / ".piopm"
+    if piopm.exists():
+        try:
+            meta = json.loads(piopm.read_text())
+        except (OSError, ValueError):
+            return None
+        uri = str((meta.get("spec") or {}).get("uri") or "")
+        return LibraryCopy(
+            dir=label,
+            name=str(meta.get("name") or fallback),
+            type="local" if uri.startswith("file://") else "registry",
+            version=meta.get("version"),
+        )
+    if (lib_dir / ".git").exists():
+        url: Optional[str]
+        try:
+            url = get_git_remote_url(lib_dir)
+        except (OSError, subprocess.CalledProcessError):
+            url = None
+        return LibraryCopy(dir=label, name=fallback, type="git", sha=_git_head(lib_dir), url=url)
+    if _manifest_name(lib_dir):
+        version = None
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            version = json.loads((lib_dir / "library.json").read_text()).get("version")
+        return LibraryCopy(dir=label, name=fallback, type="local", version=version)
+    return None
+
+
+def _group_copies(copies: list[LibraryCopy]) -> list[list[LibraryCopy]]:
+    """Groups (2+ copies, sorted by dir) that are one library: same name or same git URL."""
+    parent = list(range(len(copies)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    first_by_key: dict[str, int] = {}
+    for i, copy in enumerate(copies):
+        keys = [f"name:{copy.name.lower()}"]
+        if copy.url:
+            keys.append(f"url:{_normalize_git_url(copy.url)}")
+        for key in keys:
+            if key in first_by_key:
+                parent[find(i)] = find(first_by_key[key])
+            else:
+                first_by_key[key] = i
+    groups: dict[int, list[LibraryCopy]] = {}
+    for i, copy in enumerate(copies):
+        groups.setdefault(find(i), []).append(copy)
+    found = [sorted(g, key=lambda c: c.dir) for g in groups.values() if len(g) > 1]
+    return sorted(found, key=lambda g: g[0].dir)
+
+
+def _env_lib_deps(project_dir: Path, env_name: str) -> list[str]:
+    """The env's lib_deps through the adapter, else a plain read of platformio.ini."""
+    try:
+        config = _pio_adapter_factory().user_config(project_dir)
+        return [str(spec) for spec in config.get(f"env:{env_name}", "lib_deps", []) or []]
+    except Exception:  # best effort: requesters are a hint, never a failure
+        pass
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        parser.read(Path(project_dir) / "platformio.ini", encoding="utf-8")
+    except configparser.Error:
+        return []
+    for section in (f"env:{env_name}", "env"):
+        if parser.has_option(section, "lib_deps"):
+            value = parser.get(section, "lib_deps")
+            return [v.strip() for v in value.replace(",", "\n").splitlines() if v.strip()]
+    return []
+
+
+def _parse_requirement(source: Optional[str], spec: str) -> _Requirement:
+    match = _LIB_DEP_URL_RE.search(spec)
+    if match:
+        prefix = spec[: match.start()].strip()
+        name = prefix[:-1].strip() if prefix.endswith(("=", "@")) else None
+        return _Requirement(source, spec, name or None, match.group(1), match.group(2))
+    name, requirement = _split_registry_spec(spec)
+    return _Requirement(source, spec, name.split("/")[-1].strip(), None, requirement)
+
+
+def _library_json_requirements(lib_dir: Path, source: str) -> list[_Requirement]:
+    """The ``dependencies`` of a library.json (dict or list form) as requirements."""
+    try:
+        data = json.loads((lib_dir / "library.json").read_text())
+    except (OSError, ValueError):
+        return []
+    deps = data.get("dependencies") if isinstance(data, dict) else None
+    if isinstance(deps, dict):
+        items = [{"name": name, "version": version} for name, version in deps.items()]
+    elif isinstance(deps, list):
+        items = [d for d in deps if isinstance(d, dict) and d.get("name")]
+    else:
+        return []
+    found: list[_Requirement] = []
+    for item in items:
+        full_name = str(item["name"])
+        if item.get("owner"):
+            full_name = f"{item['owner']}/{full_name}"
+        version = str(item.get("version") or "").strip()
+        spec = f"{full_name}@{version}" if version else full_name
+        parsed = _parse_requirement(source, version) if version else None
+        name = full_name.split("/")[-1].strip()
+        if parsed and parsed.url:
+            found.append(_Requirement(source, spec, name, parsed.url, parsed.requirement))
+        else:
+            found.append(_Requirement(source, spec, name, None, version or None))
+    return found
+
+
+def _requirements(project_dir: Path, env_name: str) -> list[_Requirement]:
+    """What asks for libraries: the env's lib_deps, and the library.json of every library in
+    the env's libdeps and the project's ``lib/``."""
+    found = [_parse_requirement(None, spec) for spec in _env_lib_deps(project_dir, env_name)]
+    libdeps_dir = Path(project_dir) / ".pio" / "libdeps" / env_name
+    for base, prefix in ((libdeps_dir, ""), (Path(project_dir) / "lib", "lib/")):
+        if base.is_dir():
+            for lib_dir in sorted(base.iterdir()):
+                if lib_dir.is_dir():
+                    found.extend(_library_json_requirements(lib_dir, prefix + lib_dir.name))
+    return found
+
+
+def _accepts(requirement: _Requirement, copy: LibraryCopy) -> bool:
+    if requirement.url:
+        if copy.type != "git" or not copy.url:
+            return False
+        if _normalize_git_url(copy.url) != _normalize_git_url(requirement.url):
+            return False
+        if _classify_git_ref(requirement.requirement) == "sha":
+            return _same_commit(copy.sha, requirement.requirement)
+        return True  # a branch or tag can't be checked offline
+    if copy.type == "git":
+        return False
+    if not requirement.requirement or not copy.version:
+        return True
+    return _requirement_allows(requirement.requirement, copy.version) is not False
+
+
+def _attribute_requirements(
+    groups: list[list[LibraryCopy]], requirements: list[_Requirement]
+) -> None:
+    """Fill ``requested_by``/``exact_pins``: each requirement goes to the copy it selects
+    (the plain directory when several would do)."""
+    for group in groups:
+        dirs = {c.dir for c in group}
+        names = {c.name.lower() for c in group}
+        urls = {_normalize_git_url(c.url) for c in group if c.url}
+        for req in requirements:
+            if req.source in dirs:
+                continue  # a copy's own manifest
+            by_url = bool(req.url) and _normalize_git_url(str(req.url)) in urls
+            if not by_url and not (req.name and req.name.lower() in names):
+                continue
+            chosen = [c for c in group if _accepts(req, c)]
+            plain = [c for c in (chosen or group) if "@" not in c.dir]
+            if plain:
+                chosen = plain[:1]
+            for copy in chosen:
+                copy.requested_by.append(req.label())
+                if req.source is not None and req.exact and req.requirement:
+                    copy.exact_pins.append((req.source, req.requirement))
+
+
+def find_duplicate_libraries(project_dir: Path, env_name: str) -> list[list[LibraryCopy]]:
+    """Installed copies in ``.pio/libdeps/<env>`` (``@<ver>``/``@src-`` dirs included) that
+    are the same library; only groups of 2+, each sorted by directory name."""
+    libdeps_dir = Path(project_dir) / ".pio" / "libdeps" / env_name
+    if not libdeps_dir.is_dir():
+        return []
+    copies = [
+        copy
+        for lib_dir in sorted(libdeps_dir.iterdir())
+        if lib_dir.is_dir() and _is_managed_library_dir(lib_dir)
+        for copy in [_library_copy(lib_dir)]
+        if copy is not None
+    ]
+    groups = _group_copies(copies)
+    if groups:
+        _attribute_requirements(groups, _requirements(project_dir, env_name))
+    return groups
+
+
+def _copy_version(copy: LibraryCopy) -> str:
+    if copy.type == "git" and copy.sha:
+        return copy.sha[:7]
+    return copy.version or "unknown"
+
+
+def _exact_pin_advice(group: list[LibraryCopy]) -> str:
+    """``; <lib> pins '<name>' to <req> — prefer a range ...`` for each library.json pin."""
+    advice = ""
+    seen: set[tuple[str, str]] = set()
+    for copy in group:
+        for source, requirement in copy.exact_pins:
+            if (source, requirement) in seen:
+                continue
+            seen.add((source, requirement))
+            version = re.match(r"^=*\s*v?(\d+)\.(\d+)", requirement)
+            example = f" (e.g. ^{version.group(1)}.{version.group(2)}.0)" if version else ""
+            advice += (
+                f"; {source} pins '{group[0].name}' to {requirement} — "
+                f"prefer a range{example} in library.json"
+            )
+    return advice
+
+
+def duplicate_problems(groups: list[list[LibraryCopy]]) -> list[str]:
+    """One message per group of installed duplicate copies."""
+    messages = []
+    for group in groups:
+        copies = ", ".join(
+            f"{c.dir} ({_copy_version(c)}; requested by "
+            f"{' and '.join(c.requested_by) or 'unknown'})"
+            for c in group
+        )
+        messages.append(
+            f"duplicate copies of '{group[0].name}': {copies}; make the requirements agree "
+            f"so only one copy is installed{_exact_pin_advice(group)}"
+        )
+    return messages
+
+
+def _in_duplicate_group(lib: dict[str, Any], groups: list[list[LibraryCopy]]) -> bool:
+    """Whether a lock entry is one of the duplicated libraries."""
+    for group in groups:
+        if lib.get("dir") in {c.dir for c in group}:
+            return True
+        if str(lib.get("name", "")).lower() in {c.name.lower() for c in group}:
+            return True
+        url = lib.get("url")
+        if url and _normalize_git_url(str(url)) in {
+            _normalize_git_url(c.url) for c in group if c.url
+        }:
+            return True
+    return False
+
+
+def library_findings(
+    project_dir: Path, env_name: str, env_lock: dict[str, Any]
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """(installed-duplicate warnings, drifted lock entries) for one env; shared by check and
+    the build hook. Lock entries of a duplicated library aren't compared: the duplicate
+    warning replaces a misleading "expected ..." against an arbitrary copy."""
+    groups = find_duplicate_libraries(project_dir, env_name)
+    drifted = [
+        lib
+        for lib in env_lock.get("libraries", [])
+        if lib.get("type") != "local"
+        and not _in_duplicate_group(lib, groups)
+        and not is_installed_at_locked_version(project_dir, env_name, lib)
+    ]
+    return duplicate_problems(groups), drifted
+
+
 def capture(
     project_dir: Path,
     envs: list[str],
@@ -762,6 +1107,8 @@ def capture(
         ]
         lib_deps = config.get(f"env:{env_name}", "lib_deps", []) if config is not None else []
         _annotate_git_refs(libraries, lib_deps)
+        for duplicate in duplicate_problems(find_duplicate_libraries(project_dir, env_name)):
+            print(f"  Warning: {duplicate}", file=sys.stderr)
         env_lock["libraries"] = libraries
         captured[env_name] = env_lock
         print(f"    Found {len(libraries)} libraries")
@@ -845,6 +1192,9 @@ def restore(project_dir: Path, envs: list[str]) -> int:
                 return 1
         else:
             print(f"  Platform for {env_name}: env has no locked platform; run capture")
+
+        for duplicate in duplicate_problems(find_duplicate_libraries(project_dir, env_name)):
+            print(f"  Warning: {duplicate}", file=sys.stderr)
 
         libraries = lockdata["envs"][env_name]["libraries"]
         print(f"Restoring {len(libraries)} libraries for {env_name}...")
@@ -1055,13 +1405,12 @@ def check(project_dir: Path, envs: list[str], warn_only: bool = False) -> int:
                     # Not drift: the platform can't be inspected. Libraries are still checked.
                     print(f"  WARNING: platform not checked: {exc}")
 
-        for lib in env_lock["libraries"]:
-            if lib["type"] == "local":
-                continue
-
-            if not is_installed_at_locked_version(project_dir, env_name, lib):
-                problems_found = True
-                print(f"  {label}: {_library_drift(lib)}")
+        duplicates, drifted = library_findings(project_dir, env_name, env_lock)
+        for duplicate in duplicates:
+            print(f"  WARNING: {duplicate}")  # installed duplicates never fail check
+        for lib in drifted:
+            problems_found = True
+            print(f"  {label}: {_library_drift(lib)}")
 
     if problems_found and warn:
         print("Lockfile check found differences (reported as warnings; not failing)")
@@ -3397,11 +3746,10 @@ def _collect_build_findings(
         )
         return findings
 
-    for lib in env_lock.get("libraries", []):
-        if lib.get("type") != "local" and not is_installed_at_locked_version(
-            project_dir, env_name, lib
-        ):
-            findings.problem(_library_drift(lib), findings.restore_fix)
+    duplicates, drifted = library_findings(project_dir, env_name, env_lock)
+    findings.warnings.extend(duplicates)
+    for lib in drifted:
+        findings.problem(_library_drift(lib), findings.restore_fix)
 
     adapter = _pio_adapter_factory()
     if lockdata["lockfile_version"] < 2:
@@ -3487,6 +3835,132 @@ def build_checks(project_dir: Path, env_name: str, env: Any) -> None:
         print("  This build can't switch versions itself: install them (see above) and re-run.")
         if not _ask_to_continue():
             env.Exit(1)
+
+
+# ── Linked duplicates (pre-link check) ───────────────────────────────────────
+
+_PROGRAM_TARGET = "$BUILD_DIR/${PROGNAME}${PROGSUFFIX}"
+
+
+def _built_lib_builders(env: Any) -> Optional[list[Any]]:
+    """The library builders PlatformIO built for this image (``LibBuilderBase.is_built``).
+
+    None when PlatformIO's builders don't look as expected (the check is then skipped).
+    """
+    try:
+        builders = list(env.GetLibBuilders())
+        return [lb for lb in builders if bool(lb.is_built) and str(lb.path)]
+    except Exception:
+        return None
+
+
+def _builder_label(path: Path, project_dir: Path, env_name: str) -> str:
+    """A libdeps copy by its directory name, a project library relative to the project."""
+    libdeps = (Path(project_dir) / ".pio" / "libdeps" / env_name).resolve()
+    resolved = path.resolve()
+    if resolved.parent == libdeps:
+        return path.name
+    try:
+        return resolved.relative_to(Path(project_dir).resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def linked_duplicate_problems(project_dir: Path, env_name: str, builders: list[Any]) -> list[str]:
+    """One message per library that two or more built library builders provide."""
+    copies: list[LibraryCopy] = []
+    for lb in builders:
+        path = Path(str(lb.path))
+        label = _builder_label(path, project_dir, env_name)
+        copy = _library_copy(path, label) if path.is_dir() else None
+        copies.append(copy or LibraryCopy(dir=label, name=str(lb.name), type="local"))
+    groups = _group_copies(copies)
+    if groups:
+        _attribute_requirements(groups, _requirements(project_dir, env_name))
+    messages = []
+    for group in groups:
+        every = "both" if len(group) == 2 else "all"
+        messages.append(
+            f"linked duplicate copies of '{group[0].name}': "
+            f"{', '.join(c.dir for c in group)} — {every} are built into this image; "
+            f"make the requirements agree{_exact_pin_advice(group)}"
+        )
+    return messages
+
+
+def link_checks(project_dir: Path, env_name: str, env: Any) -> int:
+    """Before linking: report libraries built into the image more than once.
+
+    Two copies of one library in one image is the real fault (separate archives, one symbol
+    namespace). It fails a release build unless the drift policy is ``warn``; otherwise it
+    warns. Returns non-zero to stop the build.
+    """
+    builders = _built_lib_builders(env)
+    if builders is None:
+        print(
+            "pio-lock: WARNING: linked duplicates not checked: "
+            "PlatformIO's library builders are not readable in this version"
+        )
+        return 0
+    problems = linked_duplicate_problems(project_dir, env_name, builders)
+    if not problems:
+        return 0
+    fail = _is_release_mode(load_snapshot(project_dir), env) and drift_policy(env) == "fail"
+    label = "ERROR" if fail else "WARNING"
+    print(f"pio-lock: env '{env_name}':")
+    for problem in problems:
+        print(f"  {label}: {problem}")
+    if not fail:
+        return 0
+    sys.stdout.flush()
+    print(
+        f"pio-lock: ERROR: build stopped: env '{env_name}' links duplicate library copies in "
+        f"release mode (to build anyway: {_DRIFT_ENV_VAR}=warn or {_DRIFT_INI_OPTION} = warn)",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _register_link_check(project_dir: Path, env_name: str, env: Any) -> None:
+    """Run link_checks just before the program is linked (not for pio-lock's own targets)."""
+    if _is_lock_target_run(_requested_targets(env)):
+        return
+
+    def action(target: Any = None, source: Any = None, env: Any = env) -> int:
+        return link_checks(project_dir, env_name, env)
+
+    try:
+        _add_prelink_action(env, action)
+    except Exception as exc:
+        print(f"pio-lock: WARNING: linked duplicates not checked: {_describe(exc)}")
+
+
+def _add_prelink_action(env: Any, action: Callable[..., int]) -> None:
+    """Attach ``action`` to the program node once PlatformIO has defined it.
+
+    PlatformIO's ``AddPreAction`` applies at once to a file that already exists, and the
+    program node defined later replaces that action; only its delayed list (processed after
+    the build script) survives. So register there, on the shared DefaultEnvironment.
+    """
+    try:
+        verbose_action = env.VerboseAction(action, "pio-lock: checking linked libraries")
+    except Exception:
+        verbose_action = action
+    try:
+        from SCons.Environment import Base  # type: ignore[import-not-found]
+        from SCons.Script import DefaultEnvironment  # type: ignore[import-not-found]
+    except ImportError:
+        env.AddPreAction(_PROGRAM_TARGET, verbose_action)
+        return
+    shared = DefaultEnvironment()
+    if shared.get("_PIO_DELAYED_ACTIONS") is None:
+        env.AddPreAction(_PROGRAM_TARGET, verbose_action)
+        return
+
+    def add(nodes: Any, act: Any) -> Any:
+        return Base.AddPreAction(shared, nodes, act)
+
+    shared.Append(_PIO_DELAYED_ACTIONS=[(add, [_PROGRAM_TARGET], verbose_action)])
 
 
 def register_pio_targets(env: Any) -> None:
@@ -3575,6 +4049,7 @@ def register_pio_targets(env: Any) -> None:
 
     # Compare the env being built with the lock (skipped for pio-lock's own targets)
     build_checks(project_dir, env.subst("$PIOENV"), env)
+    _register_link_check(project_dir, env.subst("$PIOENV"), env)
 
 
 # Auto-register targets when loaded as a PIO extra_script
@@ -3694,9 +4169,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="PlatformIO project directory (default: current directory)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    # -d is also accepted after the subcommand; SUPPRESS keeps a value given before it.
+    project_dir_arg = argparse.ArgumentParser(add_help=False)
+    project_dir_arg.add_argument(
+        "-d",
+        "--project-dir",
+        default=argparse.SUPPRESS,
+        help="PlatformIO project directory (default: current directory)",
+    )
 
     p_capture = sub.add_parser(
         "capture",
+        parents=[project_dir_arg],
         help="Capture resolved dependency versions into pio.lock.json",
     )
     p_capture.add_argument(
@@ -3714,6 +4198,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     p_restore = sub.add_parser(
         "restore",
+        parents=[project_dir_arg],
         help="Install exact versions from pio.lock.json",
     )
     p_restore.add_argument(
@@ -3726,6 +4211,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     p_check = sub.add_parser(
         "check",
+        parents=[project_dir_arg],
         help="Verify the installed platform, packages and libraries match pio.lock.json",
     )
     p_check.add_argument(
@@ -3743,6 +4229,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     p_outdated = sub.add_parser(
         "outdated",
+        parents=[project_dir_arg],
         help="Check for outdated dependencies",
     )
     p_outdated.add_argument(
@@ -3761,6 +4248,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     p_update = sub.add_parser(
         "update",
+        parents=[project_dir_arg],
         help="Move the lock to newer versions (and platformio.ini versions within range)",
     )
     p_update.add_argument(
@@ -3798,6 +4286,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     p_init = sub.add_parser(
         "init",
+        parents=[project_dir_arg],
         help=f"Add {LOCK_INI_NAME} to [platformio] extra_configs in platformio.ini",
     )
     p_init.add_argument(
@@ -3814,7 +4303,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "snapshot-print": "Display build_snapshot.json contents",
     }
     for name, help_text in snapshot_cmds.items():
-        sub.add_parser(name, help=help_text)
+        sub.add_parser(name, help=help_text, parents=[project_dir_arg])
 
     args = parser.parse_args(argv)
     if argv is None and args.command != "init":
