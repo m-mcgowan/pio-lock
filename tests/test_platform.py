@@ -1077,3 +1077,48 @@ def test_real_adapter_converts_config_parse_errors(tmp_path: Path, exc: Exceptio
     (tmp_path / "platformio.ini").write_text("[env:x\n")
     with pytest.raises(pio_lock.ProjectConfigError, match=r"platformio\.ini"):
         _StubAdapter(modules).user_config(tmp_path)
+
+
+# ── check: a config file read after pio.lock.ini overriding the lock ─────────
+
+
+def _override_after_lock_ini(project: Path) -> None:
+    (project / "late.ini").write_text("[env:testenv]\nplatform = espressif32\n")
+    (project / "platformio.ini").write_text(
+        "[platformio]\nextra_configs = pio.lock.ini\n  late.ini\n"
+        "[env:testenv]\nplatform = espressif32\n"
+    )
+
+
+def test_check_reports_override_after_lock_ini(
+    tmp_project: Path, fake_pio: Any, capsys: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PIO_LOCK_ALLOW_OVERRIDE", raising=False)
+    _locked_project(tmp_project, fake_pio, _lock())
+    _override_after_lock_ini(tmp_project)
+    assert pio_lock.check(tmp_project, ["testenv"]) == 1
+    assert (
+        "DRIFT: late.ini sets platform for env 'testenv' after pio.lock.ini"
+        in capsys.readouterr().out
+    )
+
+
+def test_check_override_allowed_by_env_var_warns(
+    tmp_project: Path, fake_pio: Any, capsys: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _locked_project(tmp_project, fake_pio, _lock())
+    _override_after_lock_ini(tmp_project)
+    monkeypatch.setenv("PIO_LOCK_ALLOW_OVERRIDE", "1")
+    assert pio_lock.check(tmp_project, ["testenv"]) == 0
+    out = capsys.readouterr().out
+    assert "WARNING: late.ini sets platform for env 'testenv' after pio.lock.ini" in out
+    assert "DRIFT" not in out
+
+
+def test_lock_overrides_none_without_include(tmp_project: Path, fake_pio: Any) -> None:
+    adapter = fake_pio({"testenv": _lock()})
+    (tmp_project / "late.ini").write_text("[env:testenv]\nplatform = espressif32@7\n")
+    (tmp_project / "platformio.ini").write_text(
+        "[platformio]\nextra_configs = late.ini\n[env:testenv]\nplatform = espressif32\n"
+    )
+    assert pio_lock.lock_overrides(tmp_project, "testenv", adapter) == []

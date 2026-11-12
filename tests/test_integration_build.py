@@ -559,3 +559,116 @@ def test_check_malformed_ini_is_clean_error(tmp_path: Path) -> None:
     assert result.returncode == 1, result.stdout
     assert "Error: invalid PlatformIO project configuration" in result.stdout
     assert "Traceback" not in result.stdout
+
+
+# ── Build-time drift checks (pio.lock.ini included) ──────────────────────────
+
+
+def _commit_and_snapshot(p: Path) -> None:
+    """Commit the project and refresh build_snapshot.json, so release builds accept it."""
+    subprocess.run(["git", "-C", str(p), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            *["git", "-c", "user.name=T", "-c", "user.email=t@e.com", "-C", str(p)],
+            *["commit", "-q", "--allow-empty", "-m", "update"],
+        ],
+        check=True,
+        capture_output=True,
+    )
+    result = run_pio(p, "run", "-e", "native", "-t", "snapshot-capture")
+    assert result.returncode == 0, result.stdout
+
+
+def _locked_build_project(tmp_path: Path) -> tuple[Path, str]:
+    """A native project wired to pio-lock, captured and with pio.lock.ini included.
+
+    Returns the project and its [env:native] body (without the platform line).
+    """
+    p = make_native_project(tmp_path / "proj", "[env:native]\nplatform = native\n")
+    lib = piolock_lib(p)
+    (p / ".gitignore").write_text(".pio/\nbuild_snapshot.json\n")
+    env_body = f"extra_scripts = pre:{lib}/pio_lock.py\n"
+    (p / "platformio.ini").write_text(f"[env:native]\nplatform = native\n{env_body}")
+    assert run_pio(p, "pkg", "install", "-e", "native").returncode == 0
+    cli = [sys.executable, str(REPO_ROOT / "pio_lock.py"), "-d", str(p)]
+    for args in (["capture", "-e", "native"], ["init"]):
+        result = _run_cli([*cli, *args])
+        assert result.returncode == 0, result.stdout
+    _commit_and_snapshot(p)
+    return p, env_body
+
+
+def _set_env(p: Path, env_body: str, platform: str, extra: str = "") -> None:
+    """Rewrite [env:native] keeping the [platformio] section init added."""
+    ini = (p / "platformio.ini").read_text()
+    head = ini[: ini.index("[env:native]")]
+    (p / "platformio.ini").write_text(
+        f"{head}[env:native]\nplatform = {platform}\n{env_body}{extra}"
+    )
+    _commit_and_snapshot(p)
+
+
+_RELEASE = {"PIO_RELEASE_BUILD": "1"}
+
+
+@requires_pio
+def test_lock_ini_end_to_end(tmp_path: Path) -> None:
+    p, env_body = _locked_build_project(tmp_path)
+    ok = run_pio(p, "run", "-e", "native")
+    assert ok.returncode == 0, ok.stdout
+    assert "compared with pio.lock.json" not in ok.stdout
+    assert "extra_configs = pio.lock.ini' (or run" not in ok.stdout
+    released = run_pio(p, "run", "-e", "native", env=_RELEASE)
+    assert released.returncode == 0, released.stdout
+
+    _set_env(p, env_body, "native@*")
+    stale = run_pio(p, "run", "-e", "native", env=_RELEASE)
+    assert stale.returncode != 0, stale.stdout
+    assert "platform spec changed" in stale.stdout
+    assert "run: pio-lock capture -e native" in stale.stdout
+
+
+@requires_pio
+def test_release_build_drift_env_var_warns(tmp_path: Path) -> None:
+    p, env_body = _locked_build_project(tmp_path)
+    _set_env(p, env_body, "native@*")
+    result = run_pio(p, "run", "-e", "native", env={**_RELEASE, "PIO_LOCK_DRIFT": "warn"})
+    assert result.returncode == 0, result.stdout
+    assert "WARNING: platform spec changed" in result.stdout
+
+
+@requires_pio
+def test_release_build_drift_ini_option_warns(tmp_path: Path) -> None:
+    p, env_body = _locked_build_project(tmp_path)
+    _set_env(p, env_body, "native@*", extra="custom_pio_lock_drift = warn\n")
+    env = {**_RELEASE}
+    result = subprocess.run(
+        ["pio", "run", "-e", "native", "-d", str(p)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env={k: v for k, v in {**os.environ, **env}.items() if k != "PIO_LOCK_DRIFT"},
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stdout
+    assert "WARNING: platform spec changed" in result.stdout
+
+
+@requires_pio
+def test_release_build_override_allowed(tmp_path: Path) -> None:
+    p, _ = _locked_build_project(tmp_path)
+    (p / "late.ini").write_text("[env:native]\nplatform = native\n")
+    ini = (p / "platformio.ini").read_text()
+    (p / "platformio.ini").write_text(
+        ini.replace("extra_configs = pio.lock.ini", "extra_configs = pio.lock.ini\n  late.ini")
+    )
+    assert "late.ini" in (p / "platformio.ini").read_text()
+    _commit_and_snapshot(p)
+
+    failed = run_pio(p, "run", "-e", "native", env=_RELEASE)
+    assert failed.returncode != 0, failed.stdout
+    assert "late.ini sets platform for env 'native' after pio.lock.ini" in failed.stdout
+
+    allowed = run_pio(p, "run", "-e", "native", env={**_RELEASE, "PIO_LOCK_ALLOW_OVERRIDE": "1"})
+    assert allowed.returncode == 0, allowed.stdout
+    assert "WARNING: late.ini sets platform" in allowed.stdout

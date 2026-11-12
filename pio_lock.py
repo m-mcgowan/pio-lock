@@ -890,6 +890,55 @@ def platform_drift(
     return problems
 
 
+_ALLOW_OVERRIDE_ENV_VAR = "PIO_LOCK_ALLOW_OVERRIDE"
+_LOCKED_OPTIONS = ("platform", "platform_packages")
+
+
+def _allow_override_from_env() -> Optional[bool]:
+    """``PIO_LOCK_ALLOW_OVERRIDE`` as a bool; None when unset or unrecognised."""
+    value = os.environ.get(_ALLOW_OVERRIDE_ENV_VAR, "").strip().lower()
+    if value in ("1", "true", "yes"):
+        return True
+    if value in ("0", "false", "no"):
+        return False
+    return None
+
+
+def lock_overrides(project_dir: Path, env: str, adapter: PioAdapter) -> list[str]:
+    """One message per config file read after pio.lock.ini that sets a locked option for ``env``.
+
+    Files are taken in PlatformIO's read order (``adapter.config_files``). Only ``[env:<env>]``
+    counts: a later ``[env]`` value does not override pio.lock.ini's ``[env:<env>]``. Empty when
+    pio.lock.ini is not included. May raise PioIncompatible or ValueError like the adapter.
+    """
+    project_dir = Path(project_dir)
+    lock_ini = os.path.realpath(project_dir / LOCK_INI_NAME)
+    files = adapter.config_files(project_dir)
+    positions = [i for i, f in enumerate(files) if os.path.realpath(f) == lock_ini]
+    if not positions:
+        return []
+    messages: list[str] = []
+    for path in files[positions[0] + 1 :]:
+        parser = configparser.ConfigParser(interpolation=None, strict=False)
+        try:
+            parser.read(path, encoding="utf-8")
+        except configparser.Error:
+            continue  # PlatformIO reports a broken config itself
+        section = f"env:{env}"
+        options = [o for o in _LOCKED_OPTIONS if parser.has_option(section, o)]
+        if not options:
+            continue
+        try:
+            name = Path(os.path.relpath(path, project_dir)).as_posix()
+        except ValueError:  # different drive on Windows
+            name = str(path)
+        messages.append(
+            f"{name} sets {', '.join(options)} for env '{env}' after {LOCK_INI_NAME}, "
+            "overriding the lock"
+        )
+    return messages
+
+
 def check(project_dir: Path, envs: list[str], warn_only: bool = False) -> int:
     """Verify installed state matches the lockfile.
 
@@ -933,6 +982,16 @@ def check(project_dir: Path, envs: list[str], warn_only: bool = False) -> int:
                     for problem in drift:
                         problems_found = True
                         print(f"  {label}: {problem}")
+                    allow_override = bool(_allow_override_from_env())
+                    for override in lock_overrides(project_dir, env_name, adapter):
+                        if allow_override:
+                            print(f"  WARNING: {override} (allowed by {_ALLOW_OVERRIDE_ENV_VAR})")
+                        else:
+                            problems_found = True
+                            print(
+                                f"  {label}: {override}; move {LOCK_INI_NAME} last in "
+                                f"extra_configs, or set {_ALLOW_OVERRIDE_ENV_VAR}=1"
+                            )
                 except ValueError as exc:  # includes ProjectConfigError
                     print(f"Error: {exc}", file=sys.stderr)
                     return 1
@@ -946,10 +1005,7 @@ def check(project_dir: Path, envs: list[str], warn_only: bool = False) -> int:
 
             if not is_installed_at_locked_version(project_dir, env_name, lib):
                 problems_found = True
-                if lib["type"] == "registry":
-                    print(f"  {label}: {lib['name']} — expected {lib['version']}")
-                elif lib["type"] == "git":
-                    print(f"  {label}: {lib['name']} — expected SHA {lib['sha'][:12]}")
+                print(f"  {label}: {_library_drift(lib)}")
 
     if problems_found and warn:
         print("Lockfile check found differences (reported as warnings; not failing)")
@@ -962,6 +1018,13 @@ def check(project_dir: Path, envs: list[str], warn_only: bool = False) -> int:
     else:
         print("Lockfile check passed — all libraries match")
     return 0
+
+
+def _library_drift(lib: dict[str, Any]) -> str:
+    """How a locked (registry or git) library differs: what the lock expects."""
+    if lib["type"] == "git":
+        return f"{lib['name']} — expected SHA {lib['sha'][:12]}"
+    return f"{lib['name']} — expected {lib['version']}"
 
 
 def _lib_install_spec(lib: dict[str, Any]) -> Optional[str]:
@@ -2228,6 +2291,205 @@ def _already_loaded(env: Any) -> bool:
     return True
 
 
+_DRIFT_INI_OPTION = "custom_pio_lock_drift"
+_ALLOW_OVERRIDE_INI_OPTION = "custom_pio_lock_allow_override"
+_DRIFT_PROMPT = "Continue with this build? [c]ontinue / [a]bort: "
+_INCLUDE_HINT = (
+    f"pio-lock: add 'extra_configs = {LOCK_INI_NAME}' (or run pio-lock init) to pin the platform"
+)
+
+
+def _project_option(env: Any, name: str) -> str:
+    """A platformio.ini option for the env being built, lower-cased ("" when unavailable)."""
+    try:
+        return str(env.GetProjectOption(name, "") or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def drift_policy(env: Any) -> str:
+    """``"fail"`` or ``"warn"``: ``PIO_LOCK_DRIFT``, then ``custom_pio_lock_drift``; default fail.
+
+    The policy only matters in release mode: outside it, drift always warns.
+    """
+    policy = _drift_policy_from_env()
+    if policy:
+        return policy
+    value = _project_option(env, _DRIFT_INI_OPTION)
+    return value if value in ("warn", "fail") else "fail"
+
+
+def _allow_override(env: Any) -> bool:
+    """``PIO_LOCK_ALLOW_OVERRIDE``, then ``custom_pio_lock_allow_override``; default False."""
+    from_env = _allow_override_from_env()
+    if from_env is not None:
+        return from_env
+    return _project_option(env, _ALLOW_OVERRIDE_INI_OPTION) in ("true", "1", "yes")
+
+
+def _is_interactive() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+class _BuildFindings:
+    """What build_checks found for one env, and the commands that fix it."""
+
+    def __init__(self, env_name: str) -> None:
+        self.problems: list[str] = []  # drift: fails a release build under the fail policy
+        self.warnings: list[str] = []  # reported, never fails
+        self.hints: list[str] = []
+        self.fixes: list[str] = []
+        self.restore_fix = (
+            f"run: pio-lock restore -e {env_name}  "
+            "(installs the locked versions; then re-run the build)"
+        )
+        self.capture_fix = (
+            f"run: pio-lock capture -e {env_name}  (records the current config in the lock)"
+        )
+
+    def problem(self, text: str, fix: Optional[str] = None) -> None:
+        self.problems.append(text)
+        if fix and fix not in self.fixes:
+            self.fixes.append(fix)
+
+
+def _platform_build_findings(
+    project_dir: Path,
+    env_name: str,
+    env_lock: dict[str, Any],
+    adapter: PioAdapter,
+    allow_override: bool,
+    findings: _BuildFindings,
+) -> None:
+    """Platform checks for a v2 lock: include hint, drift, later-config overrides."""
+    lock_ini = os.path.realpath(Path(project_dir) / LOCK_INI_NAME)
+    if not any(os.path.realpath(f) == lock_ini for f in adapter.config_files(project_dir)):
+        findings.hints.append(_INCLUDE_HINT)
+        return
+    if not env_lock.get("platform"):
+        findings.warnings.append(
+            f"platform not checked: env '{env_name}' has no locked platform; "
+            f"run: pio-lock capture -e {env_name}"
+        )
+        return
+    for problem in platform_drift(project_dir, env_name, env_lock, adapter):
+        stale = problem.endswith("run capture")  # _lock_staleness: the ini changed
+        findings.problem(problem, findings.capture_fix if stale else findings.restore_fix)
+    for override in lock_overrides(project_dir, env_name, adapter):
+        if allow_override:
+            findings.warnings.append(f"{override} (allowed)")
+        else:
+            findings.problem(
+                f"{override}; move {LOCK_INI_NAME} last in extra_configs, or set "
+                f"{_ALLOW_OVERRIDE_ENV_VAR}=1 / {_ALLOW_OVERRIDE_INI_OPTION} = true to allow it"
+            )
+
+
+def _collect_build_findings(
+    project_dir: Path, env_name: str, env: Any, release: bool
+) -> _BuildFindings:
+    findings = _BuildFindings(env_name)
+    try:
+        lockdata = load_lockfile(Path(project_dir) / LOCKFILE_NAME)
+    except (OSError, ValueError) as exc:
+        findings.problem(f"can't read {LOCKFILE_NAME}: {exc}", findings.capture_fix)
+        return findings
+    env_lock = lockdata.get("envs", {}).get(env_name)
+    if env_lock is None:
+        findings.problem(f"env '{env_name}' is not in {LOCKFILE_NAME}", findings.capture_fix)
+        return findings
+
+    for lib in env_lock.get("libraries", []):
+        if lib.get("type") != "local" and not is_installed_at_locked_version(
+            project_dir, env_name, lib
+        ):
+            findings.problem(_library_drift(lib), findings.restore_fix)
+
+    adapter = _pio_adapter_factory()
+    if lockdata["lockfile_version"] < 2:
+        findings.hints.append(
+            f"platform not checked: lockfile is v1; run: pio-lock capture -e {env_name} "
+            "to lock the platform"
+        )
+    else:
+        try:
+            _platform_build_findings(
+                project_dir, env_name, env_lock, adapter, _allow_override(env), findings
+            )
+        except (PioIncompatible, ValueError) as exc:
+            # A release build must not silently lose its platform lock.
+            message = f"platform not checked: {exc}"
+            (findings.problems if release else findings.warnings).append(message)
+
+    running = adapter.core_version()
+    locked = str(lockdata.get("pio_core_version") or "unknown")
+    if "unknown" not in (running, locked) and running != locked:
+        findings.warnings.append(
+            f"PlatformIO Core {running} differs from the locked {locked} (warning only)"
+        )
+    return findings
+
+
+def _ask_to_continue() -> bool:
+    while True:
+        try:
+            answer = input(_DRIFT_PROMPT).strip().lower()
+        except EOFError:
+            return False
+        if answer in ("c", "continue"):
+            return True
+        if answer in ("a", "abort"):
+            return False
+
+
+def build_checks(project_dir: Path, env_name: str, env: Any) -> None:
+    """Compare the env being built with pio.lock.json; warn, prompt, or stop the build.
+
+    Runs from the build hook on every normal build (never for pio-lock's own targets).
+    Drift fails a release build unless the drift policy is ``warn``; outside release mode it
+    warns, and in an interactive terminal asks whether to continue. The build can't switch
+    platforms or libraries itself, so the guidance is to install (restore) and re-run.
+    """
+    if _is_lock_target_run(_requested_targets(env)):
+        return
+    if not (Path(project_dir) / LOCKFILE_NAME).exists():
+        return
+    release = _is_release_mode(load_snapshot(project_dir), env)
+    found = _collect_build_findings(project_dir, env_name, env, release)
+
+    fail = bool(found.problems) and release and drift_policy(env) == "fail"
+    if found.problems or found.warnings:
+        label = "ERROR" if fail else "WARNING"
+        print(f"pio-lock: env '{env_name}' compared with {LOCKFILE_NAME}:")
+        for problem in found.problems:
+            print(f"  {label}: {problem}")
+        for warning in found.warnings:
+            print(f"  WARNING: {warning}")
+        for fix in found.fixes:
+            print(f"  {fix}")
+    for hint in found.hints:
+        print(hint if hint.startswith("pio-lock:") else f"pio-lock: {hint}")
+
+    if not found.problems:
+        return
+    if fail:
+        sys.stdout.flush()  # keep the details above the error when both go to one pipe
+        print(
+            f"pio-lock: ERROR: build stopped: env '{env_name}' differs from {LOCKFILE_NAME} "
+            f"in release mode (to build anyway: {_DRIFT_ENV_VAR}=warn or "
+            f"{_DRIFT_INI_OPTION} = warn)",
+            file=sys.stderr,
+        )
+        env.Exit(1)
+    elif not release and _is_interactive():
+        print("  This build can't switch versions itself: install them (see above) and re-run.")
+        if not _ask_to_continue():
+            env.Exit(1)
+
+
 def register_pio_targets(env: Any) -> None:
     """Register custom PIO targets when loaded via lib_deps or as an extra_script.
 
@@ -2311,6 +2573,9 @@ def register_pio_targets(env: Any) -> None:
     # Auto-manage snapshot on every build
     checks = not _is_lock_target_run(_requested_targets(env))
     snapshot_auto_manage(project_dir, env, checks=checks)
+
+    # Compare the env being built with the lock (skipped for pio-lock's own targets)
+    build_checks(project_dir, env.subst("$PIOENV"), env)
 
 
 # Auto-register targets when loaded as a PIO extra_script
