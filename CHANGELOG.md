@@ -5,6 +5,15 @@ Follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-14
+
+### Fixed
+- `restore` failed on platform packages locked from a URL, such as pioarduino's
+  `framework-arduinoespressif32` release archive: it ran `pio pkg install --tool "name @ <url>"`,
+  which PlatformIO rejects ("VCS: Unknown repository type"). It now passes the bare URL (pinned
+  to the locked commit for git URLs). `pio.lock.ini` keeps the `name @ <url>` form, which
+  `platform_packages` needs.
+
 ## [0.4.2] - 2026-11-14
 
 ### Fixed

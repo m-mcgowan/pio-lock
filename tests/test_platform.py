@@ -1053,6 +1053,31 @@ def test_restore_installs_platform_before_libraries(
     assert not any("tool-local" in " ".join(c) for c in calls)
 
 
+def test_restore_installs_url_package_by_bare_url(
+    tmp_project: Path, fake_pio: Any, mock_git_commands: Any
+) -> None:
+    # `pio pkg install --tool "name @ <url>"` fails for an archive URL ("VCS: Unknown
+    # repository type"); the CLI takes the bare URL. The name form is only for platform_packages.
+    url = "https://github.com/espressif/arduino-esp32/releases/download/3.3.11/esp32-core-3.3.11.tar.xz"
+    git = "git+https://github.com/acme/tool-git.git"
+    locked = _lock(
+        packages=[
+            PackageLock("framework-arduinoespressif32", "3.3.11", src_url=url),
+            PackageLock("tool-git", "1.0.0+sha.abc1234", src_url=git),
+        ]
+    )
+    fake_pio({"testenv": locked})
+    (tmp_project / ".pio" / "libdeps" / "testenv").mkdir(parents=True)
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    mock_git_commands.clear()
+
+    assert pio_lock.restore(tmp_project, ["testenv"]) == 0
+    tools = [c[c.index("--tool") + 1] for c in _install_calls(mock_git_commands) if "--tool" in c]
+    assert tools == [url, f"{git}#abc1234"]
+    ini = (tmp_project / "pio.lock.ini").read_text()
+    assert f"framework-arduinoespressif32 @ {url}" in ini
+
+
 def test_restore_v1_lockfile_installs_libraries_only(
     tmp_project: Path, mock_git_commands: Any
 ) -> None:

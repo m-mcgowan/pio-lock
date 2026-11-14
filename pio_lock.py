@@ -1297,6 +1297,10 @@ def _restore_platform(project_dir: Path, env_name: str, platform: dict[str, Any]
         if spec is None:
             print(f"  Package {pkg['name']} is a local tool managed by the platform; skipped")
             continue
+        if pkg.get("src_url"):
+            # `pio pkg install` can't parse "name @ <archive url>" (the platform_packages
+            # form); it takes the bare URL and reads the name from the package.
+            spec = _pinned_src_url(str(pkg["src_url"]), str(pkg["version"]))
         installs.append(("--tool", spec))
     for flag, spec in installs:
         print(f"  Installing: {spec}")
