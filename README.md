@@ -10,9 +10,9 @@ PlatformIO resolves library and platform versions at install time but has no loc
 |---------|--------|------|------|-------|----------|-------|---------|
 | **Dependency scanning** | [pio_lock.py](pio_lock.py) | [README](README.md) | [pio_lock.py](pio_lock.py) | [test_scan](tests/test_scan.py) | [fixtures/](tests/fixtures/) | | |
 | **Lockfile generation** | [pio_lock.py](pio_lock.py) | [README](README.md#lockfile-format) | [pio_lock.py](pio_lock.py) | [test_commands](tests/test_commands.py) | [minimal-native](tests/fixtures/minimal-native/) | | 0.4.0 |
-| **Platform locking (`pio.lock.ini`)** | [pio_lock.py](pio_lock.py) | [README](README.md#pinning-the-platform) | [pio_lock.py](pio_lock.py) | [test_platform](tests/test_platform.py), [test_integration_build](tests/test_integration_build.py) | | 0.4.0 | |
+| **Platform locking (`pio.lock.ini`)** | [pio_lock.py](pio_lock.py) | [README](README.md#pinning-the-platform) | [pio_lock.py](pio_lock.py) | [test_platform](tests/test_platform.py), [test_integration_build](tests/test_integration_build.py) | | 0.4.0 | 0.4.1 |
 | **`init` (add the include)** | [pio_lock.py](pio_lock.py) | [README](README.md#pinning-the-platform) | [pio_lock.py](pio_lock.py) | [test_init](tests/test_init.py) | | 0.4.0 | |
-| **Build-time drift check** | [pio_lock.py](pio_lock.py) | [README](README.md#what-a-plain-pio-run-pins) | [pio_lock.py](pio_lock.py) | [test_hook](tests/test_hook.py) | | 0.4.0 | |
+| **Build-time drift check** | [pio_lock.py](pio_lock.py) | [README](README.md#what-a-plain-pio-run-pins) | [pio_lock.py](pio_lock.py) | [test_hook](tests/test_hook.py) | | 0.4.0 | 0.4.1 |
 | **Build snapshot** | [pio_lock.py](pio_lock.py) | [README](README.md#reproducible-binaries-build-snapshot) | [pio_lock.py](pio_lock.py) | [test_snapshot](tests/test_snapshot.py) | | | 0.4.0 |
 | **Outdated detection** | [pio_lock.py](pio_lock.py) | [README](README.md#updating) | [pio_lock.py](pio_lock.py) | [test_outdated](tests/test_outdated.py) | | | 0.4.0 |
 | **Update commands** | [pio_lock.py](pio_lock.py) | [README](README.md#updating) | [pio_lock.py](pio_lock.py) | [test_commands](tests/test_commands.py) | | | 0.4.0 |

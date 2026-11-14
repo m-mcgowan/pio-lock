@@ -70,7 +70,8 @@ class FakePioAdapter:
     (defaults to the locked name/version). ``by_spec`` maps an installed-package spec ->
     PlatformLock for ``resolve_platform(..., installed_spec=...)``. ``installed_packages`` is
     the set of (name, version) ``package_installed`` accepts (default: every package of
-    ``platforms``). ``incompatible`` names a call: probe/resolve/in_use then raise PioIncompatible.
+    ``platforms``); ``installed_owners`` maps (name, version) to the installed copy's owner.
+    ``incompatible`` names a call: probe/resolve/in_use then raise PioIncompatible.
     ``installable`` maps a platform spec -> the PlatformLock ``install_platform`` makes
     resolvable (for the env, and by that spec); every call is recorded in ``installed_calls`` as
     (env, spec). ``install_error`` makes ``install_platform`` raise it.
@@ -84,6 +85,7 @@ class FakePioAdapter:
         incompatible: Optional[str] = None,
         core: str = "6.1.18",
         installed_packages: Optional[set[tuple[str, str]]] = None,
+        installed_owners: Optional[dict[tuple[str, str], str]] = None,
         latest_versions: Optional[dict[str, Optional[str]]] = None,
         by_spec: Optional[dict[str, PlatformLock]] = None,
         installable: Optional[dict[str, PlatformLock]] = None,
@@ -99,6 +101,7 @@ class FakePioAdapter:
         self.incompatible = incompatible
         self.core = core
         self.installed_packages = installed_packages
+        self.installed_owners_map = installed_owners or {}
         self.latest_versions = latest_versions or {}
 
     def _check(self) -> None:
@@ -166,7 +169,19 @@ class FakePioAdapter:
             }
         else:
             installed = self.installed_packages
-        return (package["name"], package["version"]) in installed
+        key = (package["name"], package["version"])
+        if key not in installed:
+            return False
+        owner = self.installed_owners_map.get(key)
+        locked = None if package.get("src_url") else package.get("owner")
+        return not (owner and locked and owner != locked)
+
+    def installed_owners(
+        self, package: dict[str, Any], project_dir: Optional[Path] = None
+    ) -> list[str]:
+        self._check()
+        key = (package["name"], package["version"])
+        return [self.installed_owners_map.get(key, "")] if key in self.installed_owners_map else []
 
     def platform_in_use(self, project_dir: Path, env: str) -> tuple[str, str]:
         self._check()

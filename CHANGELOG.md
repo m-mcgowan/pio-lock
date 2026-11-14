@@ -5,6 +5,21 @@ Follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-14
+
+### Fixed
+- `capture` recorded a platform package under the owner named in the platform's `platform.json`
+  rather than the owner of the copy actually installed. With pioarduino, `tool-scons` was locked
+  as `pioarduino/tool-scons@4.40801.0` (PlatformIO Core installs `platformio/tool-scons`), a
+  package no registry has, so `restore` and every build using the generated `pio.lock.ini`
+  failed with `UnknownPackageError`. The lock now describes the installed copy; `platform.json`'s
+  owner is used only when the installed copy records none.
+- `check` and the build-time check passed a lock like that, because they matched the package by
+  name and version alone. A locked owner must now match the installed copy's, and the mismatch is
+  reported: `package tool-scons: locked as pioarduino/tool-scons@4.40801.0, but the installed copy
+  is platformio/tool-scons; run capture --install`. **Fix** for locks written by 0.4.0: run
+  `pio-lock capture -e <env>` again and commit `pio.lock.json` and `pio.lock.ini`.
+
 ## [0.4.0] - 2026-11-12
 
 pio-lock now locks each env's platform and platform packages as well as its libraries, can be

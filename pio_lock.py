@@ -1387,7 +1387,17 @@ def platform_drift(
     if version != platform["version"]:
         problems.append(f"platform {name}: locked {platform['version']}, in use {version}")
     for pkg in platform.get("packages", []):
-        if not adapter.package_installed(pkg, project_dir):
+        if adapter.package_installed(pkg, project_dir):
+            continue
+        others = [o for o in adapter.installed_owners(pkg, project_dir) if o]
+        if others and not pkg.get("src_url"):
+            # Locks from 0.4.0 could record platform.json's owner rather than the installed
+            # copy's; restore would ask the registry for a package that doesn't exist.
+            problems.append(
+                f"package {pkg['name']}: locked as {_package_exact_spec(pkg)}, but the "
+                f"installed copy is {others[0]}/{pkg['name']}; {_STALE_FIX}"
+            )
+        else:
             problems.append(f"package {pkg['name']}: locked {pkg['version']} is not installed")
     return problems
 
@@ -1973,12 +1983,19 @@ class PioAdapter:
                 if not pkg or not pkg.metadata:
                     raise PlatformNotInstalled(env)
                 meta = pkg.metadata
+                # Describe the installed copy: platform.json's owner can name a different
+                # package (pioarduino lists tool-scons as a pioarduino release zip, while Core
+                # installs platformio/tool-scons). Its owner is only a fallback.
+                external = bool(meta.spec.external)
+                installed_owner = meta.spec.owner
+                if not installed_owner and not external:
+                    installed_owner = options.get("owner")
                 result.append(
                     PackageLock(
                         name=str(meta.name),
                         version=str(meta.version),
-                        owner=options.get("owner") or meta.spec.owner,
-                        src_url=str(meta.spec.uri) if meta.spec.external else None,
+                        owner=str(installed_owner) if installed_owner else None,
+                        src_url=str(meta.spec.uri) if external else None,
                     )
                 )
         return result
@@ -1990,10 +2007,11 @@ class PioAdapter:
 
         Looks for the exact spec first, then matches by name and exact version among the
         installed tool packages (which also covers packages with no exact spec, e.g. file://).
+        A locked owner must match the installed copy's owner, when the copy records one.
         The installed list is read once per adapter (``install_platform`` resets it).
         """
         manager_cls = self._lookup("platformio.package.manager.tool", "ToolPackageManager")
-        name, version = str(package["name"]), str(package["version"])
+        version = str(package["version"])
         call = "platformio.package.manager.tool.ToolPackageManager"
         cwd = _chdir(project_dir) if project_dir else contextlib.nullcontext()
         with cwd, self._calling(call):
@@ -2003,15 +2021,35 @@ class PioAdapter:
                 found = manager.get_package(spec) if spec else None
                 if found is not None and str(found.metadata.version) == version:
                     return True
-            # Listing every installed tool reads each package's manifest: once per adapter.
-            cache = self.__dict__.setdefault("_installed_tools", {})
-            key = str(project_dir or "")
-            if key not in cache:
+        owners = self._installed_owners(package, project_dir)
+        locked_owner = None if package.get("src_url") else package.get("owner")
+        return any(not locked_owner or not owner or owner == locked_owner for owner in owners)
+
+    def installed_owners(
+        self, package: dict[str, Any], project_dir: Optional[Path] = None
+    ) -> list[str]:
+        """Owners of the installed copies of ``package`` at its locked version ("" if none)."""
+        return self._installed_owners(package, project_dir)
+
+    def _installed_owners(self, package: dict[str, Any], project_dir: Optional[Path]) -> list[str]:
+        manager_cls = self._lookup("platformio.package.manager.tool", "ToolPackageManager")
+        call = "platformio.package.manager.tool.ToolPackageManager"
+        cwd = _chdir(project_dir) if project_dir else contextlib.nullcontext()
+        # Listing every installed tool reads each package's manifest: once per adapter.
+        cache = self.__dict__.setdefault("_installed_tools", {})
+        key = str(project_dir or "")
+        if key not in cache:
+            with cwd, self._calling(call):
                 cache[key] = [
-                    (str(pkg.metadata.name), str(pkg.metadata.version))
-                    for pkg in manager.get_installed()
+                    (
+                        str(pkg.metadata.name),
+                        str(pkg.metadata.version),
+                        str(getattr(getattr(pkg.metadata, "spec", None), "owner", None) or ""),
+                    )
+                    for pkg in manager_cls().get_installed()
                 ]
-            return (name, version) in cache[key]
+        name, version = str(package["name"]), str(package["version"])
+        return [o for n, v, o in cache[key] if n == name and v == version]
 
     def latest_platform_version(self, name: str, owner: Optional[str] = None) -> Optional[str]:
         """Newest registry version of a platform, or None if the registry can't be reached."""

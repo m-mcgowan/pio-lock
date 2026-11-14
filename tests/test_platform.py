@@ -1885,3 +1885,78 @@ def test_capture_install_type_error_inside_platformio_fails(
         "Error: installing platform for env 'testenv' failed: "
         "could not install platform espressif32: TypeError: boom"
     ) in capsys.readouterr().err
+
+
+# ── Package owners: describe the installed copy (0.4.1) ──────────────────────
+
+
+def _installed(name: str, version: str, owner: str | None, uri: str | None = None) -> Any:
+    spec = SimpleNamespace(owner=owner, uri=uri, external=uri is not None)
+    return SimpleNamespace(metadata=SimpleNamespace(name=name, version=version, spec=spec))
+
+
+def test_used_packages_records_the_installed_copys_owner() -> None:
+    """platform.json may name one owner while PlatformIO installed another package.
+
+    pioarduino's platform.json lists tool-scons with owner pioarduino (a release zip), but
+    PlatformIO Core installs its own platformio/tool-scons. The lock must describe what is
+    installed, or restore asks the registry for pioarduino/tool-scons, which doesn't exist.
+    """
+    installed = {
+        "tool-scons": _installed("tool-scons", "4.40801.0", "platformio"),
+        "toolchain-xtensa": _installed("toolchain-xtensa", "8.4.0", None),
+        "framework-x": _installed(
+            "framework-x", "3.0.0", None, uri="https://example.com/framework-x-3.0.0.zip"
+        ),
+    }
+    platform = SimpleNamespace(
+        packages={
+            "tool-scons": {"type": "tool", "owner": "pioarduino"},
+            "toolchain-xtensa": {"type": "toolchain", "owner": "espressif"},
+            "framework-x": {"type": "framework", "owner": "pioarduino"},
+            "tool-optional": {"type": "tool", "owner": "x", "optional": True},
+        },
+        get_package=installed.get,
+    )
+    packages = {p.name: p for p in _StubAdapter(_stub_modules())._used_packages(platform, "esp32")}
+    assert set(packages) == {"tool-scons", "toolchain-xtensa", "framework-x"}
+    assert packages["tool-scons"].owner == "platformio"
+    assert pio_lock._package_exact_spec(asdict(packages["tool-scons"])) == (
+        "platformio/tool-scons@4.40801.0"
+    )
+    # No owner on the installed copy: platform.json's owner is the best description.
+    assert packages["toolchain-xtensa"].owner == "espressif"
+    assert packages["framework-x"].src_url == "https://example.com/framework-x-3.0.0.zip"
+
+
+def test_real_adapter_package_installed_requires_the_locked_owner(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        _StubToolPackageManager,
+        "installed",
+        [_installed("tool-scons", "4.40801.0", "platformio")],
+    )
+    adapter = _StubAdapter(_stub_modules())
+    wrong = {"name": "tool-scons", "version": "4.40801.0", "owner": "pioarduino"}
+    assert not adapter.package_installed(wrong)
+    assert adapter.installed_owners(wrong) == ["platformio"]
+    assert adapter.package_installed({**wrong, "owner": "platformio"})
+    assert adapter.package_installed({"name": "tool-scons", "version": "4.40801.0"})
+
+
+def test_check_reports_a_package_locked_under_another_owner(
+    tmp_project: Path, fake_pio: Any, capsys: Any
+) -> None:
+    """A 0.4.0 lock that recorded platform.json's owner fails check, naming the fix."""
+    locked = _lock(packages=[PackageLock("tool-scons", "4.40801.0", owner="pioarduino")])
+    _locked_project(tmp_project, fake_pio, locked)
+    fake_pio(
+        {"testenv": locked},
+        installed_packages={("tool-scons", "4.40801.0")},
+        installed_owners={("tool-scons", "4.40801.0"): "platformio"},
+    )
+    assert pio_lock.check(tmp_project, ["testenv"]) == 1
+    out = capsys.readouterr().out
+    assert (
+        "package tool-scons: locked as pioarduino/tool-scons@4.40801.0, but the installed "
+        "copy is platformio/tool-scons; run capture --install"
+    ) in out
