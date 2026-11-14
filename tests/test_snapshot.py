@@ -49,6 +49,18 @@ def snapshot_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
+def _make_dirty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the mocked git report uncommitted changes to tracked files."""
+    clean_run = pio_lock._run_cmd
+
+    def dirty_run(args, cwd=None, check=True):
+        if args[:2] == ["git", "status"]:
+            return " M src/main.cpp"
+        return clean_run(args, cwd=cwd, check=check)
+
+    monkeypatch.setattr(pio_lock, "_run_cmd", dirty_run)
+
+
 class TestGenerateSnapshot:
     def test_creates_file(self, snapshot_project: Path):
         pio_lock.generate_snapshot(snapshot_project)
@@ -194,19 +206,49 @@ class TestReleaseMode:
         assert pio_lock._is_release_mode(None) is False
         assert pio_lock._is_release_mode({"pinned": False}) is False
 
-    def test_release_mode_fails_when_no_snapshot(self, snapshot_project: Path, monkeypatch):
+    def test_release_mode_derives_a_missing_snapshot_from_a_clean_commit(
+        self, snapshot_project: Path, monkeypatch
+    ):
+        """A fresh clone (no build_snapshot.json) builds a release: the commit fixes the epoch."""
         monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
         fake_env = FakePioEnv()
         pio_lock.snapshot_auto_manage(snapshot_project, fake_env)
-        assert fake_env.exit_code == 1
+        assert fake_env.exit_code is None
+        assert os.environ["SOURCE_DATE_EPOCH"] == str(COMMIT_EPOCH)
 
-    def test_release_mode_fails_when_stale(self, snapshot_project: Path, monkeypatch):
+    def test_release_mode_replaces_a_stale_snapshot_on_a_clean_tree(
+        self, snapshot_project: Path, monkeypatch
+    ):
         monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
         data = {
             "source_date_epoch": 1700000000,
             "build_date": "2023-11-14T22:13:20+00:00",
             "git_commit": "old_commit",
         }
+        (snapshot_project / pio_lock.SNAPSHOT_NAME).write_text(json.dumps(data))
+        fake_env = FakePioEnv()
+        pio_lock.snapshot_auto_manage(snapshot_project, fake_env)
+        assert fake_env.exit_code is None
+        assert os.environ["SOURCE_DATE_EPOCH"] == str(COMMIT_EPOCH)
+
+    def test_release_mode_fails_without_a_snapshot_on_a_dirty_tree(
+        self, snapshot_project: Path, monkeypatch, capsys
+    ):
+        """A dirty tree has no reproducible epoch, so release mode still refuses it."""
+        _make_dirty(monkeypatch)
+        monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
+        fake_env = FakePioEnv()
+        pio_lock.snapshot_auto_manage(snapshot_project, fake_env)
+        assert fake_env.exit_code == 1
+        assert "uncommitted changes" in capsys.readouterr().err
+        assert not (snapshot_project / pio_lock.SNAPSHOT_NAME).exists()
+
+    def test_release_mode_fails_with_a_stale_snapshot_on_a_dirty_tree(
+        self, snapshot_project: Path, monkeypatch
+    ):
+        _make_dirty(monkeypatch)
+        monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
+        data = {"source_date_epoch": 1700000000, "git_commit": "old_commit"}
         (snapshot_project / pio_lock.SNAPSHOT_NAME).write_text(json.dumps(data))
         fake_env = FakePioEnv()
         pio_lock.snapshot_auto_manage(snapshot_project, fake_env)
@@ -425,16 +467,12 @@ class TestEpochSourceReporting:
         assert pio_lock.snapshot_check(snapshot_project) == 1
         assert "STALE" in capsys.readouterr().out
 
-    def test_release_error_names_the_epoch_source_not_two_equal_shas(
-        self, snapshot_project, monkeypatch, capsys
+    def test_release_mode_replaces_an_old_format_snapshot_on_a_clean_tree(
+        self, snapshot_project, monkeypatch
     ):
         monkeypatch.setenv("PIO_RELEASE_BUILD", "1")
         self._write_old_format(snapshot_project)
         fake_env = FakePioEnv()
         pio_lock.snapshot_auto_manage(snapshot_project, fake_env)
-        err = capsys.readouterr().err
-        assert fake_env.exit_code == 1
-        assert "epoch source is time" in err
-        assert "the tree is clean" in err
-        assert "snapshot-capture" in err
-        assert "Snapshot commit" not in err
+        assert fake_env.exit_code is None
+        assert os.environ["SOURCE_DATE_EPOCH"] == str(COMMIT_EPOCH)

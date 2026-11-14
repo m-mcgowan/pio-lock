@@ -1960,3 +1960,99 @@ def test_check_reports_a_package_locked_under_another_owner(
         "package tool-scons: locked as pioarduino/tool-scons@4.40801.0, but the installed "
         "copy is platformio/tool-scons; run capture --install"
     ) in out
+
+
+# ── Packages the platform installs from local paths (0.4.2) ──────────────────
+
+
+def test_used_packages_records_local_tools_without_their_path(tmp_path: Path) -> None:
+    """pioarduino installs its toolchains under <core>/tools and registers them as file://.
+
+    The path ties the lock to one machine and core dir. Lock name and version (what the
+    platform pins), plus the URL platform.json declares for that version, and no path.
+    """
+    zip_url = "https://github.com/pioarduino/registry/releases/download/0.0.1/xtensa.zip"
+    installed = {
+        "toolchain-xtensa-esp-elf": _installed(
+            "toolchain-xtensa-esp-elf",
+            "14.2.0+20260121",
+            None,
+            uri="file:///Users/someone/.platformio-x/tools/toolchain-xtensa-esp-elf",
+        ),
+        "tool-esptoolpy": _installed(
+            "tool-esptoolpy", "5.3.0", None, uri="file:///elsewhere/tools/tool-esptoolpy"
+        ),
+    }
+    declared = {
+        "toolchain-xtensa-esp-elf": {
+            "type": "toolchain",
+            "owner": "pioarduino",
+            "package-version": "14.2.0+20260121",
+            "version": zip_url,
+        },
+        # platform.json declares another version than the one installed: no URL recorded.
+        "tool-esptoolpy": {
+            "type": "uploader",
+            "owner": "pioarduino",
+            "package-version": "5.2.0",
+            "version": "https://example.com/esptool-5.2.0.zip",
+        },
+    }
+    manifest = tmp_path / "platform.json"
+    manifest.write_text(json.dumps({"name": "espressif32", "packages": declared}))
+    # pioarduino rewrites each installed tool's "version" to its local path at runtime.
+    in_memory = {
+        name: {**opts, "version": f"/Users/someone/.platformio-x/packages/{name}"}
+        for name, opts in declared.items()
+    }
+    platform = SimpleNamespace(
+        packages=in_memory, manifest_path=str(manifest), get_package=installed.get
+    )
+    packages = {p.name: p for p in _StubAdapter(_stub_modules())._used_packages(platform, "esp32")}
+    xtensa = asdict(packages["toolchain-xtensa-esp-elf"])
+    assert xtensa["version"] == "14.2.0+20260121"
+    assert xtensa["local"] is True
+    assert xtensa["src_url"] is None
+    assert xtensa["owner"] is None
+    assert xtensa["platform_url"] == zip_url
+    assert "file://" not in json.dumps(xtensa)
+    esptool = asdict(packages["tool-esptoolpy"])
+    assert esptool["local"] is True and esptool["platform_url"] is None
+    # Not pinned in pio.lock.ini: the locked platform installs them itself.
+    assert pio_lock._package_exact_spec(xtensa) is None
+
+
+def test_local_packages_are_matched_by_name_and_version(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        _StubToolPackageManager,
+        "installed",
+        [_installed("toolchain-x", "1.0.0", None, uri="file:///a/tools/toolchain-x")],
+    )
+    adapter = _StubAdapter(_stub_modules())
+    assert adapter.package_installed({"name": "toolchain-x", "version": "1.0.0", "local": True})
+    assert not adapter.package_installed(
+        {"name": "toolchain-x", "version": "1.0.1", "local": True}
+    )
+
+
+def test_lock_ini_omits_local_packages(tmp_project: Path, fake_pio: Any) -> None:
+    locked = _lock(
+        packages=[
+            PackageLock("toolchain-x", "1.0.0", local=True, platform_url="https://e.com/x.zip"),
+            PackageLock("tool-scons", "4.40801.0", owner="platformio"),
+        ]
+    )
+    fake_pio({"testenv": locked})
+    assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+    ini = (tmp_project / pio_lock.LOCK_INI_NAME).read_text()
+    assert "toolchain-x" not in ini
+    assert "platformio/tool-scons@4.40801.0" in ini
+    lock = json.loads((tmp_project / pio_lock.LOCKFILE_NAME).read_text())
+    packages = lock["envs"]["testenv"]["platform"]["packages"]
+    # Registry packages don't carry the new keys as nulls.
+    assert packages[1] == {
+        "name": "tool-scons",
+        "version": "4.40801.0",
+        "owner": "platformio",
+        "src_url": None,
+    }

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import pio_lock
 from tests.conftest import espressif32_lock, write_lockfile
 
@@ -671,3 +673,48 @@ class TestCaptureGitRefs:
         )
         assert lib["ref"] == "v2.0"
         assert lib["ref_type"] == "tag"
+
+
+class TestCaptureFloatingGitNote:
+    """capture records what is installed; a branch or bare git spec gets a pointer to update."""
+
+    def _capture(self, tmp_project, make_git_lib, fake_pio, spec, capsys):
+        (tmp_project / "platformio.ini").write_text(
+            f"[env:testenv]\nplatform = espressif32\nboard = esp32dev\nlib_deps =\n  {spec}\n"
+        )
+        make_git_lib(
+            "testenv",
+            "x",
+            sha="abc1234",
+            url="https://github.com/o/x.git",
+            project_dir=tmp_project,
+        )
+        fake_pio({"testenv": espressif32_lock()})
+        assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+        return capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "spec", ["https://github.com/o/x.git", "https://github.com/o/x.git#main"]
+    )
+    def test_floating_spec_names_outdated_and_update(
+        self, tmp_project, make_git_lib, fake_pio, capsys, spec
+    ):
+        out = self._capture(tmp_project, make_git_lib, fake_pio, spec, capsys)
+        assert "x: locked the installed commit abc1234" in out
+        assert "pio-lock outdated" in out
+        assert "pio-lock update" in out
+
+    @pytest.mark.parametrize(
+        "spec", ["https://github.com/o/x.git#v1.2.0", "https://github.com/o/x.git#abc1234"]
+    )
+    def test_fixed_ref_has_no_note(self, tmp_project, make_git_lib, fake_pio, capsys, spec):
+        out = self._capture(tmp_project, make_git_lib, fake_pio, spec, capsys)
+        assert "locked the installed commit" not in out
+
+    def test_transitive_git_dependency_has_no_note(
+        self, tmp_project, make_git_lib, fake_pio, capsys
+    ):
+        out = self._capture(
+            tmp_project, make_git_lib, fake_pio, "https://github.com/o/other.git", capsys
+        )
+        assert "locked the installed commit" not in out

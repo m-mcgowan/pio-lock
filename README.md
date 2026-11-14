@@ -170,7 +170,7 @@ platform_packages =
 - Git platforms and packages are pinned to the exact commit (`…#<sha>`), even when your spec names a branch or no ref.
 - Packages from a URL are written as `<name> @ <url>`, so PlatformIO treats them as overrides of the platform's package.
 - Your own `platform_packages` are kept, at their exact resolved versions (in PlatformIO's normalised `git+…` form for git sources), so the generated line never drops them.
-- Packages installed from a local `file://` path (for example tools pioarduino installs from its own directory) are recorded and checked in `pio.lock.json`, but left out of `pio.lock.ini` — a local path would break on other machines.
+- Packages installed from a local `file://` path (pioarduino unpacks its toolchains and tools under `<core_dir>/tools`) are locked by name and version with `"local": true`, plus the URL the platform's `platform.json` declares for that version (`platform_url`) — never the path, which differs between machines and core directories. They're left out of `pio.lock.ini`: the locked platform installs them itself, at the versions its `platform.json` fixes. `check` and the build compare them by name and version.
 
 It only takes effect once `platformio.ini` includes it:
 
@@ -422,7 +422,11 @@ The `lock-*` targets act on the env being built: `pio run -e my_env -t lock-capt
 
 ## Reproducible binaries (build snapshot)
 
-On every build pio-lock sets `SOURCE_DATE_EPOCH` from `build_snapshot.json`, so `__DATE__`/`__TIME__` are deterministic. The epoch is the HEAD commit's time on a clean tree, so the same commit gives the same epoch everywhere; a dirty tree falls back to the current time and prints `non-reproducible: …`. The snapshot's epoch overrides any `SOURCE_DATE_EPOCH` already set. In release mode a missing or stale snapshot fails the build; run `pio run -t snapshot-capture` (which works in release mode).
+On every build pio-lock sets `SOURCE_DATE_EPOCH` from `build_snapshot.json`, so `__DATE__`/`__TIME__` are deterministic. The epoch is the HEAD commit's time on a clean tree, so the same commit gives the same epoch everywhere; a dirty tree falls back to the current time and prints `non-reproducible: …`. The snapshot's epoch overrides any `SOURCE_DATE_EPOCH` already set.
+
+**Don't commit `build_snapshot.json`** — add it to `.gitignore`. It's derived from git and rewritten when HEAD (or whether the tree is dirty) changes. The exception is a **pinned** snapshot (`"pinned": true`), which you commit on purpose to fix the epoch regardless of the commit.
+
+In release mode a missing or stale snapshot is derived from HEAD's commit time when the tree is clean, so a fresh clone builds a release as is. On a dirty tree there is no reproducible epoch, so a missing or stale snapshot fails the release build: commit (or stash) the changes, or pin a snapshot with `pio run -t snapshot-capture`.
 
 ## Lockfile format
 
@@ -490,7 +494,8 @@ On every build pio-lock sets `SOURCE_DATE_EPOCH` from `build_snapshot.json`, so 
 
 - `platform.spec` and `platform.platform_packages_spec` are what you wrote in `platformio.ini` (ignoring `pio.lock.ini`); a change to either makes the env's lock stale.
 - `platform.src_url` / `packages[].src_url` are set for git and URL sources.
-- Git libraries record the requested `ref` and its `ref_type` (`branch`, `tag`, `sha`, or `default` for no ref).
+- Git libraries record the requested `ref` and its `ref_type` (`branch`, `tag`, `sha`, or `default` for no ref). `capture` records the commit that is installed and doesn't go online, so for a `branch` or `default` ref it notes that the lock may be behind the branch: `pio-lock outdated` reports that, and `pio-lock update` moves the lock to the branch head.
+- Packages installed from a local path carry `"local": true` and `platform_url` instead of `src_url` (see [Pinning the platform](#pinning-the-platform)).
 - `dir` is the library's directory in `.pio/libdeps/<env>/` (including `@<version>` and `@src-<hash>` copies); `check` and `restore` compare an entry against that directory when it exists. Entries without `dir` (older locks) are matched by name or git URL.
 
 Format v1 (0.3.x and earlier) had top-level `platform_url` and `global_packages` instead of per-env `platform`. pio-lock still reads v1 files — libraries work as before, platform checks are skipped with a hint — and `capture` always writes v2. Re-run `capture` to upgrade.

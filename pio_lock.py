@@ -297,19 +297,23 @@ def snapshot_auto_manage(project_dir: Path, env: Any = None, *, checks: bool = T
 
     if snapshot is None:
         if release:
-            print(
-                f"ERROR: No {SNAPSHOT_NAME} in release mode. Run: pio run -t snapshot-capture",
-                file=sys.stderr,
-            )
-            if env:
-                env.Exit(1)
-            return
-        snapshot = generate_snapshot(project_dir)
+            # A clean commit fixes the epoch, so a fresh clone can build a release as is.
+            snapshot = _release_snapshot(project_dir, f"No {SNAPSHOT_NAME}", env)
+            if snapshot is None:
+                return
+        else:
+            snapshot = generate_snapshot(project_dir)
     elif snapshot.get("pinned", False):
         # Pinned — never auto-regenerate
         pass
     elif is_snapshot_stale(snapshot, project_dir):
-        if release:
+        if release and not is_git_dirty(project_dir):
+            head = get_git_commit(project_dir)
+            print(f"Build snapshot stale (was {snapshot.get('git_commit')}, HEAD is {head}).")
+            snapshot = _release_snapshot(project_dir, f"{SNAPSHOT_NAME} is stale", env)
+            if snapshot is None:
+                return
+        elif release:
             head = get_git_commit(project_dir)
             if snapshot.get("git_commit") == head:
                 tree = "dirty" if is_git_dirty(project_dir) else "clean"
@@ -334,6 +338,28 @@ def snapshot_auto_manage(project_dir: Path, env: Any = None, *, checks: bool = T
         snapshot = generate_snapshot(project_dir)
 
     apply_snapshot(snapshot)
+
+
+def _release_snapshot(project_dir: Path, problem: str, env: Any) -> Optional[dict[str, Any]]:
+    """A release build's snapshot, derived from HEAD; None (build stopped) if not reproducible.
+
+    On a clean tree the epoch is HEAD's commit time, the same on every machine, so the
+    snapshot is written and used. A dirty tree (or no commit time) would stamp the current
+    time, which a release must not do.
+    """
+    if not is_git_dirty(project_dir) and get_commit_epoch(project_dir) is not None:
+        print(f"{problem} in release mode: deriving it from HEAD's commit time")
+        return generate_snapshot(project_dir)
+    reason = "the tree has uncommitted changes" if is_git_dirty(project_dir) else "no commit time"
+    print(
+        f"ERROR: {problem} in release mode and {reason}, so the build time can't be "
+        f"reproduced. Commit (or stash) the changes, or pin a snapshot: "
+        f"pio run -t snapshot-capture",
+        file=sys.stderr,
+    )
+    if env:
+        env.Exit(1)
+    return None
 
 
 def _is_release_mode(snapshot: Optional[dict[str, Any]], env: Any = None) -> bool:
@@ -668,10 +694,10 @@ def _platform_exact_spec(platform: dict[str, Any]) -> str:
 
 def _package_exact_spec(package: dict[str, Any]) -> Optional[str]:
     """The ``platform_packages`` entry pinning ``package``; None for machine-local packages."""
+    if _is_local_package(package):
+        return None  # a local path in a committed file would break other machines
     src_url = package.get("src_url")
     if src_url:
-        if str(src_url).startswith("file://"):
-            return None  # a local path in a committed file would break other machines
         # The name keeps PlatformIO treating it as an override of the platform's package.
         return f"{package['name']} @ {_pinned_src_url(str(src_url), str(package['version']))}"
     owner = package.get("owner")
@@ -773,6 +799,32 @@ def _annotate_git_refs(libraries: list[dict[str, Any]], lib_deps: Any) -> None:
         ref = refs.get(_normalize_git_url(str(lib["url"])))
         lib["ref"] = ref
         lib["ref_type"] = _classify_git_ref(ref)
+
+
+def _floating_git_notes(libraries: list[dict[str, Any]], lib_deps: Any) -> list[str]:
+    """Notes for lib_deps git specs that follow a branch (or the default branch).
+
+    capture records the installed commit without going online, so it can be behind the
+    branch; outdated reports that and update moves the lock to the branch head.
+    """
+    floating = set()
+    for spec in lib_deps or []:
+        match = _LIB_DEP_URL_RE.search(str(spec))
+        if match and _classify_git_ref(match.group(2)) in ("branch", "default"):
+            floating.add(_normalize_git_url(match.group(1)))
+    notes = []
+    for lib in libraries:
+        if lib.get("type") != "git" or not lib.get("url"):
+            continue
+        if _normalize_git_url(str(lib["url"])) not in floating:
+            continue
+        sha = str(lib.get("sha") or _sha_from_version(str(lib.get("version") or "")) or "")
+        ref = lib.get("ref") or "the default branch"
+        notes.append(
+            f"{lib['name']}: locked the installed commit {sha[:7] or '?'}, which may be behind "
+            f"{ref}; run pio-lock outdated to check, pio-lock update to move to its head"
+        )
+    return notes
 
 
 # ── Duplicate library copies ─────────────────────────────────────────────────
@@ -1175,7 +1227,7 @@ def capture(
                 print(f"    Installing the platform for {env_name}...")
                 adapter.install_platform(project_dir, env_name, installed_spec)
                 resolved = adapter.resolve_platform(project_dir, env_name, **kwargs)
-            env_lock["platform"] = asdict(resolved)
+            env_lock["platform"] = _platform_lock_dict(resolved)
             print(f"    Platform {env_lock['platform']['name']} {env_lock['platform']['version']}")
         except PioIncompatible as exc:
             if exc is not incompatible:  # the probe's failure was reported once, above
@@ -1203,6 +1255,8 @@ def capture(
         ]
         lib_deps = config.get(f"env:{env_name}", "lib_deps", []) if config is not None else []
         _annotate_git_refs(libraries, lib_deps)
+        for note in _floating_git_notes(libraries, lib_deps):
+            print(f"    Note: {note}")
         for duplicate in duplicate_problems(find_duplicate_libraries(project_dir, env_name)):
             print(f"  Warning: {duplicate}", file=sys.stderr)
         env_lock["libraries"] = libraries
@@ -1390,7 +1444,7 @@ def platform_drift(
         if adapter.package_installed(pkg, project_dir):
             continue
         others = [o for o in adapter.installed_owners(pkg, project_dir) if o]
-        if others and not pkg.get("src_url"):
+        if others and not pkg.get("src_url") and not _is_local_package(pkg):
             # Locks from 0.4.0 could record platform.json's owner rather than the installed
             # copy's; restore would ask the registry for a package that doesn't exist.
             problems.append(
@@ -1623,6 +1677,43 @@ class PackageLock:
     version: str
     owner: Optional[str] = None
     src_url: Optional[str] = None
+    # Installed from a local path (pioarduino's toolchains under <core>/tools). The path is
+    # machine-specific, so it isn't recorded; the locked platform installs the package itself.
+    local: Optional[bool] = None
+    # For a local package: the URL platform.json declares for this exact version.
+    platform_url: Optional[str] = None
+
+
+# PackageLock fields written only when set, so registry and URL packages keep their shape.
+_OPTIONAL_PACKAGE_KEYS = ("local", "platform_url")
+
+
+def _platform_lock_dict(platform: PlatformLock) -> dict[str, Any]:
+    data = asdict(platform)
+    for package in data["packages"]:
+        for key in _OPTIONAL_PACKAGE_KEYS:
+            if package.get(key) is None:
+                package.pop(key, None)
+    return data
+
+
+def _declared_packages(platform: Any) -> dict[str, Any]:
+    """platform.json's packages as published, re-read from disk ({} if unavailable).
+
+    ``platform.packages`` is the loaded manifest, which a platform may rewrite while configuring
+    (pioarduino replaces an installed tool's URL with its local path).
+    """
+    try:
+        manifest = json.loads(Path(platform.manifest_path).read_text())
+        packages = manifest.get("packages")
+        return packages if isinstance(packages, dict) else {}
+    except (AttributeError, TypeError, OSError, ValueError):
+        return {}
+
+
+def _is_local_package(package: dict[str, Any]) -> bool:
+    """Installed from a local path: recorded by name and version, never pinned by source."""
+    return bool(package.get("local")) or str(package.get("src_url") or "").startswith("file://")
 
 
 @dataclass
@@ -1975,6 +2066,7 @@ class PioAdapter:
         A used package that is not installed means the env is not installed.
         """
         result: list[PackageLock] = []
+        declared_packages = _declared_packages(platform)
         with self._calling("platformio.platform.base.PlatformBase.packages"):
             for pkg_name, options in platform.packages.items():
                 if options.get("optional"):
@@ -1983,10 +2075,25 @@ class PioAdapter:
                 if not pkg or not pkg.metadata:
                     raise PlatformNotInstalled(env)
                 meta = pkg.metadata
+                external = bool(meta.spec.external)
+                if external and str(meta.spec.uri or "").startswith("file://"):
+                    # pioarduino unpacks its toolchains under <core>/tools and registers them
+                    # as file:// packages: lock name and version, not this machine's path.
+                    entry = declared_packages.get(pkg_name) or options
+                    declared = str(entry.get("version") or "")
+                    same = str(entry.get("package-version") or "") == str(meta.version)
+                    result.append(
+                        PackageLock(
+                            name=str(meta.name),
+                            version=str(meta.version),
+                            local=True,
+                            platform_url=declared if "://" in declared and same else None,
+                        )
+                    )
+                    continue
                 # Describe the installed copy: platform.json's owner can name a different
                 # package (pioarduino lists tool-scons as a pioarduino release zip, while Core
                 # installs platformio/tool-scons). Its owner is only a fallback.
-                external = bool(meta.spec.external)
                 installed_owner = meta.spec.owner
                 if not installed_owner and not external:
                     installed_owner = options.get("owner")
@@ -2016,13 +2123,14 @@ class PioAdapter:
         cwd = _chdir(project_dir) if project_dir else contextlib.nullcontext()
         with cwd, self._calling(call):
             manager = manager_cls()
-            if not package.get("src_url"):
+            if not package.get("src_url") and not _is_local_package(package):
                 spec = _package_exact_spec(package)
                 found = manager.get_package(spec) if spec else None
                 if found is not None and str(found.metadata.version) == version:
                     return True
         owners = self._installed_owners(package, project_dir)
-        locked_owner = None if package.get("src_url") else package.get("owner")
+        by_source = package.get("src_url") or _is_local_package(package)
+        locked_owner = None if by_source else package.get("owner")
         return any(not locked_owner or not owner or owner == locked_owner for owner in owners)
 
     def installed_owners(

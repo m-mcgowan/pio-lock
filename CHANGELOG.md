@@ -5,6 +5,28 @@ Follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-14
+
+### Fixed
+- Packages installed from a local path were locked with that path as their source. pioarduino
+  unpacks its toolchains and tools under `<core_dir>/tools` and registers them as `file://`
+  packages, so the lock recorded `file:///Users/<you>/.platformio/tools/toolchain-…`: a path
+  that differs between machines and core directories. They are now locked by name and version
+  with `"local": true`, plus `platform_url`, the URL the platform's `platform.json` declares for
+  that version (read from the file on disk, since pioarduino rewrites it in memory). They stay
+  out of `pio.lock.ini`, because the locked platform installs them itself. Locks written by 0.4.x
+  keep working; run `capture` again to drop the paths.
+- In release mode a missing or stale `build_snapshot.json` stopped the build even on a clean
+  tree, so a fresh clone (or CI) couldn't build a release until someone ran `snapshot-capture`.
+  On a clean tree the snapshot is now derived from HEAD's commit time, which is the same on
+  every machine. A dirty tree still fails, because its epoch would be the current time.
+  `build_snapshot.json` is not meant to be committed unless it is pinned; the README now says so.
+
+### Added
+- `capture` notes git libraries whose `lib_deps` spec follows a branch or the default branch:
+  it locks the commit that is installed, which may be behind the branch head. The note points to
+  `pio-lock outdated` and `pio-lock update`.
+
 ## [0.4.1] - 2026-11-14
 
 ### Fixed

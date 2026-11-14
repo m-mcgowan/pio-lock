@@ -324,8 +324,16 @@ def test_project_dir_interpolation_independent_of_cwd(tmp_path: Path) -> None:
     assert out["user"] == expected
     assert out["full"] == expected
     assert out["resolve"]["platform_packages_spec"] == expected
+    # Found in ${PROJECT_DIR}/.pkgs (so the expansion worked); locked without its local path.
     assert out["resolve"]["packages"] == [
-        {"name": "tool-mytool", "version": "1.2.3", "owner": None, "src_url": tool_uri}
+        {
+            "name": "tool-mytool",
+            "version": "1.2.3",
+            "owner": None,
+            "src_url": None,
+            "local": True,
+            "platform_url": None,
+        }
     ]
     assert out["in_use"][0] == "native"
 
