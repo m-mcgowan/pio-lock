@@ -76,3 +76,9 @@ python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
+
+# PlatformIO ships no type information. The nightly installs it, which turns the
+# lazy imports' import-not-found into import-untyped; accept both.
+[[tool.mypy.overrides]]
+module = ["platformio.*"]
+ignore_missing_imports = true
