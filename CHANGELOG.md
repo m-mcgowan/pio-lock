@@ -5,6 +5,17 @@ Follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-18
+
+### Fixed
+- `pio.lock.ini` pinned git platforms and platform packages to a 7-digit commit
+  (`…arduino-esp32.git#15777c8`), taken from PlatformIO's `+sha.<rev>` version suffix.
+  PlatformIO installs a git pin with `git fetch --depth=1 origin <rev>`, which needs the full
+  commit, so a locked build failed with "couldn't find remote ref". `capture` now reads the full
+  commit from the installed clone and records it as `sha`; `pio.lock.ini` and `restore` pin to
+  it. A lock without `sha` (0.4.3 or earlier) keeps the requested ref, with a warning to run
+  `capture` again.
+
 ## [0.4.3] - 2026-11-14
 
 ### Fixed

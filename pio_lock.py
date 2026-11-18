@@ -667,27 +667,58 @@ def _probe(adapter: PioAdapter) -> Optional[PioIncompatible]:
 _GIT_SHA_SUFFIX_RE = re.compile(r"\+sha\.([0-9a-f]+)$")
 
 
-def _pinned_src_url(src_url: str, version: str) -> str:
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _pinned_src_url(src_url: str, version: str, sha: Optional[str] = None) -> str:
     """``src_url`` pinned to the resolved commit for git sources.
 
-    PlatformIO records the requested URI (which may name a branch or no ref at all) and puts
-    the resolved commit in the version's ``+sha.<rev>`` suffix. Other URLs are returned as-is.
+    PlatformIO records the requested URI (which may name a branch or no ref at all) and only
+    7 hex digits of the resolved commit, in the version's ``+sha.<rev>`` suffix. PlatformIO
+    installs a git pin with ``git fetch --depth=1 origin <rev>``, which needs the full commit,
+    so the pin uses ``sha`` (read from the package's clone at capture). Without it the URL is
+    kept as requested. Other URLs are returned as-is.
     """
     if not src_url.startswith("git+"):
         return src_url
-    match = _GIT_SHA_SUFFIX_RE.search(version)
-    if not match:
+    if sha and _FULL_SHA_RE.match(sha):
+        return f"{src_url.split('#', 1)[0]}#{sha}"
+    if _GIT_SHA_SUFFIX_RE.search(version):
+        print(
+            f"  Warning: the lock has no full commit for {src_url} (written by pio-lock "
+            f"0.4.3 or earlier), so {LOCK_INI_NAME} keeps the requested ref; "
+            f"run capture again to pin it",
+            file=sys.stderr,
+        )
+    else:
         print(
             f"  Warning: no resolved commit recorded for {src_url}; {LOCK_INI_NAME} can't pin it",
             file=sys.stderr,
         )
-        return src_url
-    return f"{src_url.split('#', 1)[0]}#{match.group(1)}"
+    return src_url
+
+
+def _git_commit(path: Optional[str | Path], version: str) -> Optional[str]:
+    """The full commit of a git package's clone at ``path``, if it is the one ``version`` names.
+
+    PlatformIO keeps the clone (with ``.git``) when it installs a package from git, and
+    records the commit's first 7 hex digits in the version (``+sha.<rev>``).
+    """
+    match = _GIT_SHA_SUFFIX_RE.search(version)
+    if not path or not match or not (Path(path) / ".git").exists():
+        return None
+    try:
+        sha = get_git_sha(path)
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    return sha if _FULL_SHA_RE.match(sha) and sha.startswith(match.group(1)) else None
 
 
 def _platform_exact_spec(platform: dict[str, Any]) -> str:
     if platform.get("src_url"):
-        return _pinned_src_url(str(platform["src_url"]), str(platform["version"]))
+        return _pinned_src_url(
+            str(platform["src_url"]), str(platform["version"]), platform.get("sha")
+        )
     owner = platform.get("owner") or "platformio"
     return f"{owner}/{platform['name']}@{platform['version']}"
 
@@ -699,7 +730,8 @@ def _package_exact_spec(package: dict[str, Any]) -> Optional[str]:
     src_url = package.get("src_url")
     if src_url:
         # The name keeps PlatformIO treating it as an override of the platform's package.
-        return f"{package['name']} @ {_pinned_src_url(str(src_url), str(package['version']))}"
+        pinned = _pinned_src_url(str(src_url), str(package["version"]), package.get("sha"))
+        return f"{package['name']} @ {pinned}"
     owner = package.get("owner")
     prefix = f"{owner}/" if owner else ""
     return f"{prefix}{package['name']}@{package['version']}"
@@ -1300,7 +1332,7 @@ def _restore_platform(project_dir: Path, env_name: str, platform: dict[str, Any]
         if pkg.get("src_url"):
             # `pio pkg install` can't parse "name @ <archive url>" (the platform_packages
             # form); it takes the bare URL and reads the name from the package.
-            spec = _pinned_src_url(str(pkg["src_url"]), str(pkg["version"]))
+            spec = _pinned_src_url(str(pkg["src_url"]), str(pkg["version"]), pkg.get("sha"))
         installs.append(("--tool", spec))
     for flag, spec in installs:
         print(f"  Installing: {spec}")
@@ -1686,14 +1718,19 @@ class PackageLock:
     local: Optional[bool] = None
     # For a local package: the URL platform.json declares for this exact version.
     platform_url: Optional[str] = None
+    # For a git package: the full commit. PlatformIO's version keeps only 7 hex digits
+    # ("+sha.<rev>"), which `git fetch origin <rev>` can't fetch.
+    sha: Optional[str] = None
 
 
 # PackageLock fields written only when set, so registry and URL packages keep their shape.
-_OPTIONAL_PACKAGE_KEYS = ("local", "platform_url")
+_OPTIONAL_PACKAGE_KEYS = ("local", "platform_url", "sha")
 
 
 def _platform_lock_dict(platform: PlatformLock) -> dict[str, Any]:
     data = asdict(platform)
+    if data.get("sha") is None:
+        data.pop("sha", None)
     for package in data["packages"]:
         for key in _OPTIONAL_PACKAGE_KEYS:
             if package.get(key) is None:
@@ -1731,6 +1768,8 @@ class PlatformLock:
     src_url: Optional[str]
     packages: list[PackageLock]
     owner: Optional[str] = None
+    # For a git platform: the full commit (see PackageLock.sha).
+    sha: Optional[str] = None
 
 
 class PioIncompatible(Exception):  # noqa: N818 (name fixed by the 0.4.0 interface)
@@ -2000,6 +2039,7 @@ class PioAdapter:
                 version = str(meta.version)
                 src_url = str(meta.spec.uri) if meta.spec.external else None
                 owner = str(meta.spec.owner) if meta.spec.owner else None
+        is_git = bool(src_url and src_url.startswith("git+"))
         return PlatformLock(
             spec=spec,
             platform_packages_spec=platform_packages,
@@ -2008,6 +2048,7 @@ class PioAdapter:
             src_url=src_url,
             packages=packages,
             owner=owner,
+            sha=_git_commit(getattr(pkg, "path", None), version) if is_git else None,
         )
 
     def install_platform(self, project_dir: Path, env: str, spec: Optional[str] = None) -> None:
@@ -2101,12 +2142,17 @@ class PioAdapter:
                 installed_owner = meta.spec.owner
                 if not installed_owner and not external:
                     installed_owner = options.get("owner")
+                src_url = str(meta.spec.uri) if external else None
+                is_git = bool(src_url and src_url.startswith("git+"))
                 result.append(
                     PackageLock(
                         name=str(meta.name),
                         version=str(meta.version),
                         owner=str(installed_owner) if installed_owner else None,
-                        src_url=str(meta.spec.uri) if external else None,
+                        src_url=src_url,
+                        sha=_git_commit(getattr(pkg, "path", None), str(meta.version))
+                        if is_git
+                        else None,
                     )
                 )
         return result

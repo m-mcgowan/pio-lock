@@ -167,7 +167,7 @@ platform_packages =
 ```
 
 - Registry platforms are pinned as `<owner>/<name>@<version>`.
-- Git platforms and packages are pinned to the exact commit (`…#<sha>`), even when your spec names a branch or no ref.
+- Git platforms and packages are pinned to the exact commit (`…#<sha>`, all 40 hex digits), even when your spec names a branch or no ref. `capture` reads the commit from the installed clone; PlatformIO's own version string keeps only 7 digits, which `git fetch` can't use.
 - Packages from a URL are written as `<name> @ <url>`, so PlatformIO treats them as overrides of the platform's package.
 - Your own `platform_packages` are kept, at their exact resolved versions (in PlatformIO's normalised `git+…` form for git sources), so the generated line never drops them.
 - Packages installed from a local `file://` path (pioarduino unpacks its toolchains and tools under `<core_dir>/tools`) are locked by name and version with `"local": true`, plus the URL the platform's `platform.json` declares for that version (`platform_url`) — never the path, which differs between machines and core directories. They're left out of `pio.lock.ini`: the locked platform installs them itself, at the versions its `platform.json` fixes. `check` and the build compare them by name and version.
@@ -493,7 +493,7 @@ In release mode a missing or stale snapshot is derived from HEAD's commit time w
 ```
 
 - `platform.spec` and `platform.platform_packages_spec` are what you wrote in `platformio.ini` (ignoring `pio.lock.ini`); a change to either makes the env's lock stale.
-- `platform.src_url` / `packages[].src_url` are set for git and URL sources.
+- `platform.src_url` / `packages[].src_url` are set for git and URL sources. Git sources also carry `sha`, the full commit that `pio.lock.ini` and `restore` pin to. A lock without it (0.4.3 or earlier) keeps the requested ref in `pio.lock.ini`, with a warning to run `capture` again.
 - Git libraries record the requested `ref` and its `ref_type` (`branch`, `tag`, `sha`, or `default` for no ref). `capture` records the commit that is installed and doesn't go online, so for a `branch` or `default` ref it notes that the lock may be behind the branch: `pio-lock outdated` reports that, and `pio-lock update` moves the lock to the branch head.
 - Packages installed from a local path carry `"local": true` and `platform_url` instead of `src_url` (see [Pinning the platform](#pinning-the-platform)).
 - `dir` is the library's directory in `.pio/libdeps/<env>/` (including `@<version>` and `@src-<hash>` copies); `check` and `restore` compare an entry against that directory when it exists. Entries without `dir` (older locks) are matched by name or git URL.

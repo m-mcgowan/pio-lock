@@ -333,6 +333,7 @@ def test_project_dir_interpolation_independent_of_cwd(tmp_path: Path) -> None:
             "src_url": None,
             "local": True,
             "platform_url": None,
+            "sha": None,
         }
     ]
     assert out["in_use"][0] == "native"

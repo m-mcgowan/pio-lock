@@ -451,6 +451,7 @@ def _lock(
     src_url: str | None = None,
     packages: list[PackageLock] | None = None,
     platform_packages_spec: list[str] | None = None,
+    sha: str | None = None,
 ) -> PlatformLock:
     return PlatformLock(
         spec=spec,
@@ -459,6 +460,7 @@ def _lock(
         version=version,
         src_url=src_url,
         packages=packages or [],
+        sha=sha,
     )
 
 
@@ -714,20 +716,29 @@ def _ini_for(platform: PlatformLock) -> str:
     return pio_lock.render_lock_ini({"envs": {"e": {"platform": asdict(platform)}}})
 
 
+_FULL_SHA = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
+_PKG_SHA = "9f8e7d6c5b4a39281706f5e4d3c2b1a098f7e6d5"
+
+
 def test_lock_ini_pins_git_platform_to_resolved_sha() -> None:
     ini = _ini_for(
         _lock(
             spec=f"{_GIT_PLATFORM}#main",
             version="6.6.0+sha.1a2b3c4",
             src_url=f"{_GIT_PLATFORM}#main",
+            sha=_FULL_SHA,
         )
     )
-    assert f"platform = {_GIT_PLATFORM}#1a2b3c4\n" in ini
+    assert f"platform = {_GIT_PLATFORM}#{_FULL_SHA}\n" in ini
 
 
 def test_lock_ini_pins_unpinned_git_platform() -> None:
-    ini = _ini_for(_lock(spec=_GIT_PLATFORM, version="6.6.0+sha.1a2b3c4", src_url=_GIT_PLATFORM))
-    assert f"platform = {_GIT_PLATFORM}#1a2b3c4\n" in ini
+    ini = _ini_for(
+        _lock(
+            spec=_GIT_PLATFORM, version="6.6.0+sha.1a2b3c4", src_url=_GIT_PLATFORM, sha=_FULL_SHA
+        )
+    )
+    assert f"platform = {_GIT_PLATFORM}#{_FULL_SHA}\n" in ini
 
 
 def test_lock_ini_pins_git_package_to_resolved_sha() -> None:
@@ -735,14 +746,38 @@ def test_lock_ini_pins_git_package_to_resolved_sha() -> None:
     ini = _ini_for(
         _lock(
             packages=[
-                PackageLock("framework-arduinoespressif32", "3.0.0+sha.9f8e7d6", src_url=url)
+                PackageLock(
+                    "framework-arduinoespressif32", "3.0.0+sha.9f8e7d6", src_url=url, sha=_PKG_SHA
+                )
             ]
         )
     )
     assert (
         "  framework-arduinoespressif32 @ "
-        "git+https://github.com/espressif/arduino-esp32.git#9f8e7d6\n"
+        f"git+https://github.com/espressif/arduino-esp32.git#{_PKG_SHA}\n"
     ) in ini
+
+
+def test_lock_ini_never_pins_a_short_sha(capsys: Any) -> None:
+    """PlatformIO records only 7 hex digits in "+sha.<rev>", and `git fetch --depth=1 origin
+    <rev>` needs all 40, so a short pin breaks the build. A lock without the full commit
+    (written by 0.4.3 or earlier) keeps the requested ref and says to capture again."""
+    url = "git+https://github.com/m-mcgowan/arduino-esp32.git#3.3.13-hwcdc1"
+    ini = _ini_for(
+        _lock(
+            spec=f"{_GIT_PLATFORM}#main",
+            version="6.6.0+sha.1a2b3c4",
+            src_url=f"{_GIT_PLATFORM}#main",
+            packages=[
+                PackageLock("framework-arduinoespressif32", "3.3.13+sha.15777c8", src_url=url)
+            ],
+        )
+    )
+    assert "#15777c8" not in ini and "#1a2b3c4" not in ini
+    assert f"  framework-arduinoespressif32 @ {url}\n" in ini
+    assert f"platform = {_GIT_PLATFORM}#main\n" in ini
+    err = capsys.readouterr().err
+    assert "full commit" in err and "capture" in err
 
 
 def test_lock_ini_keeps_git_url_without_sha_and_warns(capsys: Any) -> None:
@@ -1060,10 +1095,11 @@ def test_restore_installs_url_package_by_bare_url(
     # repository type"); the CLI takes the bare URL. The name form is only for platform_packages.
     url = "https://github.com/espressif/arduino-esp32/releases/download/3.3.11/esp32-core-3.3.11.tar.xz"
     git = "git+https://github.com/acme/tool-git.git"
+    sha = "abc1234" + "0" * 33
     locked = _lock(
         packages=[
             PackageLock("framework-arduinoespressif32", "3.3.11", src_url=url),
-            PackageLock("tool-git", "1.0.0+sha.abc1234", src_url=git),
+            PackageLock("tool-git", "1.0.0+sha.abc1234", src_url=git, sha=sha),
         ]
     )
     fake_pio({"testenv": locked})
@@ -1073,7 +1109,7 @@ def test_restore_installs_url_package_by_bare_url(
 
     assert pio_lock.restore(tmp_project, ["testenv"]) == 0
     tools = [c[c.index("--tool") + 1] for c in _install_calls(mock_git_commands) if "--tool" in c]
-    assert tools == [url, f"{git}#abc1234"]
+    assert tools == [url, f"{git}#{sha}"]
     ini = (tmp_project / "pio.lock.ini").read_text()
     assert f"framework-arduinoespressif32 @ {url}" in ini
 
@@ -1915,9 +1951,70 @@ def test_capture_install_type_error_inside_platformio_fails(
 # ── Package owners: describe the installed copy (0.4.1) ──────────────────────
 
 
-def _installed(name: str, version: str, owner: str | None, uri: str | None = None) -> Any:
+def _installed(
+    name: str, version: str, owner: str | None, uri: str | None = None, path: Any = None
+) -> Any:
     spec = SimpleNamespace(owner=owner, uri=uri, external=uri is not None)
-    return SimpleNamespace(metadata=SimpleNamespace(name=name, version=version, spec=spec))
+    return SimpleNamespace(
+        metadata=SimpleNamespace(name=name, version=version, spec=spec), path=path
+    )
+
+
+def _git_clone_at(path: Path) -> str:
+    """A git checkout at ``path`` with one commit; returns its full sha."""
+    path.mkdir(parents=True)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    subprocess.run(["git", "init", "-q", str(path)], check=True, env=env)
+    (path / "f").write_text("x")
+    subprocess.run(["git", "-C", str(path), "add", "f"], check=True, env=env)
+    subprocess.run(["git", "-C", str(path), "commit", "-qm", "c"], check=True, env=env)
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def test_git_commit_reads_the_full_sha_matching_the_version(tmp_path: Path) -> None:
+    """Used for git platforms and packages alike; None unless the clone matches the version."""
+    clone = tmp_path / "platform"
+    full = _git_clone_at(clone)
+    assert pio_lock._git_commit(clone, f"6.6.0+sha.{full[:7]}") == full
+    assert pio_lock._git_commit(clone, "6.6.0+sha.0000000") is None
+    assert pio_lock._git_commit(clone, "6.6.0") is None
+    assert pio_lock._git_commit(tmp_path / "missing", f"6.6.0+sha.{full[:7]}") is None
+    assert pio_lock._git_commit(None, f"6.6.0+sha.{full[:7]}") is None
+
+
+def test_used_packages_records_the_full_commit_of_a_git_package(tmp_path: Path) -> None:
+    """PlatformIO's version keeps 7 hex digits; the package's own clone has all 40."""
+    clone = tmp_path / "framework-arduinoespressif32"
+    full = _git_clone_at(clone)
+    url = "git+https://github.com/m-mcgowan/arduino-esp32.git#3.3.13-hwcdc1"
+    installed = {
+        "framework-arduinoespressif32": _installed(
+            "framework-arduinoespressif32", f"3.3.13+sha.{full[:7]}", None, uri=url, path=clone
+        ),
+        "tool-plain": _installed("tool-plain", "1.0.0", "platformio", path=tmp_path),
+    }
+    platform = SimpleNamespace(
+        packages={name: {} for name in installed}, get_package=installed.get
+    )
+    packages = {p.name: p for p in _StubAdapter(_stub_modules())._used_packages(platform, "e")}
+    assert packages["framework-arduinoespressif32"].sha == full
+    assert packages["tool-plain"].sha is None
+    ini = _ini_for(_lock(packages=list(packages.values())))
+    assert (
+        f"framework-arduinoespressif32 @ git+https://github.com/m-mcgowan/arduino-esp32.git#{full}\n"
+        in ini
+    )
+    # Registry packages keep their shape: no "sha" key.
+    data = pio_lock._platform_lock_dict(_lock(packages=list(packages.values())))
+    assert "sha" not in data and "sha" not in data["packages"][1]
 
 
 def test_used_packages_records_the_installed_copys_owner() -> None:
