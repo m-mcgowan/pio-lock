@@ -371,7 +371,7 @@ pio-lock init
 | Command | Does |
 |---|---|
 | `capture -e ENV…` | Record what's installed for each env in `pio.lock.json` and regenerate `pio.lock.ini`. No network, no installs; an env whose platform isn't installed is an error, and so is an env with `lib_deps` but no libraries installed in `.pio/libdeps/<env>/` (a fresh clone): run `pio-lock restore` first. Nothing is written when capture fails. `--install` installs it first, from your `platformio.ini` (see [Changing the platform](#changing-the-platform)). Other envs' entries are kept; envs no longer in `platformio.ini` are pruned. If pio-lock can't read PlatformIO's internals, it keeps the env's previous platform lock and warns. An unreadable `pio.lock.json` (a merge conflict, say) is replaced, with a warning. `--output PATH` writes elsewhere |
-| `restore -e ENV…` | Install the locked platform and packages, then the locked libraries |
+| `restore -e ENV…` | Install the locked platform and packages, then the locked libraries. A git library listed in `lib_deps` is installed by that entry and then checked out at the locked commit, so PlatformIO sees it as installed and doesn't add a second copy; `file://` entries in `lib_deps` are installed as declared |
 | `check -e ENV…` | Compare installed platform, packages and libraries with the lock; exit 1 on drift. The platform is compared only with `pio.lock.ini` included, as in the build. An env whose lock has no libraries while `lib_deps` lists some is reported too. `--warn-only` reports and exits 0 |
 | `outdated -e ENV…` | Report newer versions (`--json` for machine-readable output); exit 1 when updates exist |
 | `update -e ENV…` | Move the lock (and `platformio.ini` within range) forward — see [Updating](#updating) |

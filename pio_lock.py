@@ -974,6 +974,48 @@ def _installable_lib_deps(lib_deps: Any) -> list[str]:
     ]
 
 
+def _lib_deps_by_git_url(lib_deps: list[str]) -> dict[str, str]:
+    """lib_deps git entries keyed by normalized URL (the first entry for a URL wins)."""
+    specs: dict[str, str] = {}
+    for spec in lib_deps:
+        match = _LIB_DEP_URL_RE.search(spec)
+        if match:
+            specs.setdefault(_normalize_git_url(match.group(1)), spec)
+    return specs
+
+
+def _move_checkout_to(project_dir: Path, env_name: str, lib: dict[str, Any]) -> bool:
+    """Check out the locked commit in the copy PlatformIO just installed from lib_deps' spec.
+
+    The spec may name a branch or tag that has moved since capture. The checkout keeps the
+    spec PlatformIO recorded, so PlatformIO still sees the library as installed.
+    """
+    sha = str(lib["sha"])
+    plain, _ = _git_checkouts(project_dir, env_name, str(lib["url"]))
+    if not plain:
+        print(
+            f"  Error: {lib['name']} was installed, but its checkout in .pio/libdeps/{env_name} "
+            f"wasn't found, so it can't be moved to the locked commit {sha[:7]}",
+            file=sys.stderr,
+        )
+        return False
+    checkout = plain[0]
+    head = _git_head(checkout)
+    if head and (head == sha or (len(sha) < 40 and head.startswith(sha))):
+        return True
+    print(f"    {lib['name']}: moving {str(head or '?')[:7]} to the locked commit {sha[:7]}")
+    try:
+        run_cmd(["git", "fetch", "--depth=1", "origin", sha], cwd=checkout)
+        run_cmd(["git", "reset", "--hard", sha], cwd=checkout)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(
+            f"  Error: couldn't check out the locked commit {sha[:7]} of {lib['name']}: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def _env_lib_deps(project_dir: Path, env_name: str) -> list[str]:
     """The env's lib_deps through the adapter, else a plain read of platformio.ini."""
     try:
@@ -1419,22 +1461,17 @@ def restore(project_dir: Path, envs: list[str]) -> int:
         libraries = lockdata["envs"][env_name]["libraries"]
         print(f"Restoring {len(libraries)} libraries for {env_name}...")
 
+        # PlatformIO treats a git or file:// library as installed only when its recorded URL
+        # equals the lib_deps entry (ref included). Installing by those entries keeps a later
+        # `pio pkg install` or build from installing a second copy (<name>@src-<hash>).
+        lib_deps = _installable_lib_deps(_env_lib_deps(project_dir, env_name))
+        git_specs = _lib_deps_by_git_url(lib_deps)
+
         skip_count = 0
         install_count = 0
 
-        for lib in libraries:
-            if lib["type"] == "local":
-                continue
-
-            if is_installed_at_locked_version(project_dir, env_name, lib):
-                skip_count += 1
-                continue
-
-            spec = _lib_install_spec(lib)
-            if spec is None:
-                continue
-
-            print(f"  Installing: {lib['name']}")
+        def install(name: str, spec: str, env_name: str = env_name) -> bool:
+            print(f"  Installing: {name}")
             try:
                 run_cmd(
                     [
@@ -1451,10 +1488,39 @@ def restore(project_dir: Path, envs: list[str]) -> int:
                     ],
                     cwd=str(project_dir),
                 )
-                install_count += 1
             except subprocess.CalledProcessError as e:
-                print(f"  Error installing {lib['name']}: {e}", file=sys.stderr)
+                print(f"  Error installing {name}: {e}", file=sys.stderr)
+                return False
+            return True
+
+        for lib in libraries:
+            if lib["type"] == "local":
+                continue
+
+            if is_installed_at_locked_version(project_dir, env_name, lib):
+                skip_count += 1
+                continue
+
+            declared = (
+                git_specs.get(_normalize_git_url(str(lib["url"])))
+                if lib["type"] == "git" and lib.get("url") and lib.get("sha")
+                else None
+            )
+            spec = declared or _lib_install_spec(lib)
+            if spec is None:
+                continue
+            if not install(lib["name"], spec):
                 return 1
+            if declared and not _move_checkout_to(project_dir, env_name, lib):
+                return 1
+            install_count += 1
+
+        # Libraries from the project's own tree have no version to pin: install them as declared.
+        for spec in lib_deps:
+            if spec.startswith("file://"):
+                if not install(spec, spec):
+                    return 1
+                install_count += 1
 
         print(f"  Done: {install_count} installed, {skip_count} already up-to-date")
 

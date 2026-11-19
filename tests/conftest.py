@@ -174,6 +174,14 @@ def mock_git_commands(monkeypatch: pytest.MonkeyPatch):
         if args[:2] == ["pio", "pkg"]:
             return ""
 
+        if args[:2] == ["git", "fetch"]:
+            return ""
+
+        if args[:3] == ["git", "reset", "--hard"] and cwd:
+            # Move the fake checkout to the requested commit.
+            (Path(cwd) / ".pio-lock-test-sha").write_text(args[3])
+            return ""
+
         # Fall through to real command for anything unexpected
         return real_run(args, cwd=cwd, check=check)
 

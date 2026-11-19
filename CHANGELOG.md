@@ -16,6 +16,13 @@ Follows [Keep a Changelog](https://keepachangelog.com/) conventions.
   aren't installed into `.pio/libdeps`.
 - `check` passed such a lock, because the lock and the disk agreed on having no libraries. An env
   whose lock has no libraries while `lib_deps` lists some is now reported as drift.
+- `restore` installed git libraries as `<url>#<sha>`. PlatformIO treats a git library as
+  installed only when its recorded URL equals the `lib_deps` entry, ref included, so a later
+  `pio pkg install` or build installed each one again and moved restore's copy to
+  `<name>@src-<hash>`; `capture` then locked both. A git library listed in `lib_deps` is now
+  installed by that entry and checked out at the locked commit in place.
+- `restore` skipped `file://` libraries, so `capture` after `restore` dropped them from the
+  lock. `file://` entries in `lib_deps` are now installed as declared.
 
 ## [0.4.4] - 2026-11-18
 

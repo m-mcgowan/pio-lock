@@ -794,3 +794,122 @@ class TestCaptureWithoutInstalledLibraries:
         assert pio_lock.check(tmp_project, ["testenv"]) == 1
         out = capsys.readouterr().out
         assert "locks no libraries" in out and "lib_deps" in out
+
+
+_SHA = "d" * 40
+
+
+class TestRestoreMatchesLibDeps:
+    """PlatformIO treats a git or file:// library as installed only when its recorded URL equals
+    the lib_deps entry, ref included. Restore installed git libraries as <url>#<sha>, so a later
+    `pio pkg install` (or a build) installed them again and moved restore's copy to
+    <name>@src-<hash>; capture then locked both. Restore also skipped file:// lib_deps, so
+    capture after restore dropped them.
+    """
+
+    def _ini(self, project, *lib_deps):
+        lines = "".join(f"    {spec}\n" for spec in lib_deps)
+        (project / "platformio.ini").write_text(
+            f"[env:testenv]\nplatform = espressif32\nboard = esp32dev\nlib_deps =\n{lines}"
+        )
+
+    def _installs(self, log):
+        return [c[c.index("--library") + 1] for c in log if c[:3] == ["pio", "pkg", "install"]]
+
+    def test_restore_installs_a_git_library_by_its_lib_deps_spec(
+        self, tmp_project, make_git_lib, mock_git_commands
+    ):
+        spec = "https://github.com/test/dep.git#v1.0"
+        self._ini(tmp_project, spec)
+        # What PlatformIO checks out for #v1.0; the lock wants another commit (the tag moved).
+        checkout = make_git_lib(
+            "testenv",
+            "dep",
+            sha="e" * 40,
+            url="https://github.com/test/dep.git",
+            project_dir=tmp_project,
+        )
+        write_lockfile(
+            tmp_project,
+            {
+                "testenv": [
+                    {
+                        "name": "dep",
+                        "type": "git",
+                        "url": "https://github.com/test/dep.git",
+                        "sha": _SHA,
+                        "ref": "v1.0",
+                        "ref_type": "tag",
+                    }
+                ]
+            },
+        )
+        assert pio_lock.restore(tmp_project, ["testenv"]) == 0
+        assert self._installs(mock_git_commands) == [spec]
+        # ...then the checkout is moved to the locked commit, in place.
+        assert ["git", "fetch", "--depth=1", "origin", _SHA] in mock_git_commands
+        assert ["git", "reset", "--hard", _SHA] in mock_git_commands
+        assert (checkout / ".pio-lock-test-sha").read_text() == _SHA
+
+    def test_restore_leaves_a_checkout_already_at_the_locked_commit(
+        self, tmp_project, make_git_lib, mock_git_commands
+    ):
+        self._ini(tmp_project, "dep=https://github.com/test/dep.git#main")
+        make_git_lib(
+            "testenv",
+            "dep",
+            sha=_SHA,
+            url="https://github.com/test/dep.git",
+            project_dir=tmp_project,
+        )
+        write_lockfile(
+            tmp_project,
+            {
+                "testenv": [
+                    {
+                        "name": "dep",
+                        "type": "git",
+                        "url": "https://github.com/test/dep.git",
+                        "sha": _SHA,
+                    }
+                ]
+            },
+        )
+        assert pio_lock.restore(tmp_project, ["testenv"]) == 0
+        assert not any(c[:2] == ["git", "reset"] for c in mock_git_commands)
+
+    def test_restore_fails_when_the_checkout_cant_be_found(
+        self, tmp_project, mock_git_commands, capsys
+    ):
+        self._ini(tmp_project, "https://github.com/test/dep.git#v1.0")
+        (tmp_project / ".pio" / "libdeps" / "testenv").mkdir(parents=True)
+        write_lockfile(
+            tmp_project,
+            {
+                "testenv": [
+                    {
+                        "name": "dep",
+                        "type": "git",
+                        "url": "https://github.com/test/dep.git",
+                        "sha": _SHA,
+                    }
+                ]
+            },
+        )
+        assert pio_lock.restore(tmp_project, ["testenv"]) == 1
+        assert "locked commit" in capsys.readouterr().err
+
+    def test_restore_installs_file_lib_deps(self, tmp_project, mock_git_commands):
+        self._ini(tmp_project, "file://lib/ble_serial", "file://lib/units", "symlink://../x")
+        (tmp_project / ".pio" / "libdeps" / "testenv").mkdir(parents=True)
+        write_lockfile(
+            tmp_project,
+            {
+                "testenv": [
+                    {"name": "Elert BLE Serial", "type": "local", "path": "file://lib/ble_serial"},
+                    {"name": "units", "type": "local", "path": "file://lib/units"},
+                ]
+            },
+        )
+        assert pio_lock.restore(tmp_project, ["testenv"]) == 0
+        assert self._installs(mock_git_commands) == ["file://lib/ble_serial", "file://lib/units"]
