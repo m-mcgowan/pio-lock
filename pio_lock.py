@@ -961,6 +961,19 @@ def _group_copies(copies: list[LibraryCopy]) -> list[list[LibraryCopy]]:
     return sorted(found, key=lambda g: g[0].dir)
 
 
+def _installable_lib_deps(lib_deps: Any) -> list[str]:
+    """The lib_deps entries PlatformIO installs into .pio/libdeps/<env>/ and pio-lock locks.
+
+    ``symlink://`` libraries are linked rather than installed, and pio-lock doesn't lock itself.
+    """
+    specs = [str(spec).strip() for spec in lib_deps or []]
+    return [
+        spec
+        for spec in specs
+        if spec and not spec.startswith("symlink://") and "pio-lock" not in spec.lower()
+    ]
+
+
 def _env_lib_deps(project_dir: Path, env_name: str) -> list[str]:
     """The env's lib_deps through the adapter, else a plain read of platformio.ini."""
     try:
@@ -1286,6 +1299,19 @@ def capture(
             lib for lib in scan_env_libraries(project_dir, env_name) if lib["name"] != "pio-lock"
         ]
         lib_deps = config.get(f"env:{env_name}", "lib_deps", []) if config is not None else []
+        declared = _installable_lib_deps(lib_deps)
+        if declared and not libraries:
+            # Typically a fresh clone: capture records what's installed, and nothing is yet.
+            # Locking "no libraries" would silently drop them from the lock.
+            print(
+                f"Error: env '{env_name}' has lib_deps ({len(declared)}), but no libraries are "
+                f"installed in .pio/libdeps/{env_name}; capture records what is installed, so "
+                f"it would lock none. Install them first: pio-lock restore -e {env_name} (the "
+                f"locked versions) or pio pkg install -e {env_name}, then capture again. "
+                f"Nothing was written.",
+                file=sys.stderr,
+            )
+            return 1
         _annotate_git_refs(libraries, lib_deps)
         for note in _floating_git_notes(libraries, lib_deps):
             print(f"    Note: {note}")
@@ -1632,6 +1658,16 @@ def check(project_dir: Path, envs: list[str], warn_only: bool = False) -> int:
                     else:
                         print(f"  WARNING: platform not checked: {exc}")
                         incompatible_reported = exc is incompatible
+
+        if not env_lock.get("libraries"):
+            declared = _installable_lib_deps(_env_lib_deps(project_dir, env_name))
+            if declared:
+                problems_found = True
+                print(
+                    f"  {label}: the lock locks no libraries, but lib_deps lists "
+                    f"{len(declared)}; it was probably captured before they were installed. "
+                    f"Restore {LOCKFILE_NAME} from git, run pio-lock restore, then capture"
+                )
 
         duplicates, drifted = library_findings(project_dir, env_name, env_lock)
         for duplicate in duplicates:

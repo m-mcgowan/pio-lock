@@ -718,3 +718,79 @@ class TestCaptureFloatingGitNote:
             tmp_project, make_git_lib, fake_pio, "https://github.com/o/other.git", capsys
         )
         assert "locked the installed commit" not in out
+
+
+_LIB_DEPS_INI = (
+    "[env:testenv]\nplatform = espressif32\nboard = esp32dev\n"
+    "lib_deps =\n    bblanchon/ArduinoJson @ ^7.0.0\n"
+)
+
+
+class TestCaptureWithoutInstalledLibraries:
+    """capture records what is installed; with nothing installed it must not lock 'no libraries'.
+
+    In a fresh clone .pio/libdeps/<env> doesn't exist yet. Capturing then used to write
+    "libraries": [] over the committed lock (exit 0, one stderr warning), and check passed
+    because the lock and the disk agreed on nothing.
+    """
+
+    def _locked(self, project, make_registry_lib, fake_pio):
+        (project / "platformio.ini").write_text(_LIB_DEPS_INI)
+        make_registry_lib("testenv", "ArduinoJson", "7.0.4", project_dir=project)
+        fake_pio({"testenv": espressif32_lock()})
+        assert pio_lock.capture(project, ["testenv"]) == 0
+        return (project / "pio.lock.json").read_text()
+
+    def test_capture_refuses_when_libdeps_is_missing(
+        self, tmp_project, make_registry_lib, fake_pio, capsys
+    ):
+        before = self._locked(tmp_project, make_registry_lib, fake_pio)
+        import shutil
+
+        shutil.rmtree(tmp_project / ".pio" / "libdeps")
+        capsys.readouterr()
+
+        assert pio_lock.capture(tmp_project, ["testenv"]) == 1
+        assert (tmp_project / "pio.lock.json").read_text() == before
+        err = capsys.readouterr().err
+        assert "lib_deps" in err and "no libraries are installed" in err
+        assert "pio-lock restore" in err
+
+    def test_capture_refuses_when_libdeps_is_empty(
+        self, tmp_project, make_registry_lib, fake_pio, capsys
+    ):
+        before = self._locked(tmp_project, make_registry_lib, fake_pio)
+        import shutil
+
+        shutil.rmtree(tmp_project / ".pio" / "libdeps" / "testenv" / "ArduinoJson")
+        assert pio_lock.capture(tmp_project, ["testenv"]) == 1
+        assert (tmp_project / "pio.lock.json").read_text() == before
+
+    def test_capture_allows_only_local_and_pio_lock_lib_deps(self, tmp_project, fake_pio):
+        """symlink:// libraries aren't installed into libdeps, and pio-lock isn't locked."""
+        (tmp_project / "platformio.ini").write_text(
+            "[env:testenv]\nplatform = espressif32\nboard = esp32dev\n"
+            "lib_deps =\n    symlink://../mylib\n"
+            "    https://github.com/m-mcgowan/pio-lock.git#v0.4.4\n"
+        )
+        fake_pio({"testenv": espressif32_lock()})
+        assert pio_lock.capture(tmp_project, ["testenv"]) == 0
+        data = json.loads((tmp_project / "pio.lock.json").read_text())
+        assert data["envs"]["testenv"]["libraries"] == []
+
+    def test_check_fails_when_the_lock_has_no_libraries_but_lib_deps_has(
+        self, tmp_project, fake_pio, capsys
+    ):
+        """A lock written by the old behaviour: check must not report it as matching."""
+        (tmp_project / "platformio.ini").write_text(_LIB_DEPS_INI)
+        fake_pio({"testenv": espressif32_lock()})
+        data = {
+            "lockfile_version": 2,
+            "pio_core_version": "6.1.18",
+            "envs": {"testenv": {"libraries": []}},
+        }
+        (tmp_project / "pio.lock.json").write_text(json.dumps(data))
+
+        assert pio_lock.check(tmp_project, ["testenv"]) == 1
+        out = capsys.readouterr().out
+        assert "locks no libraries" in out and "lib_deps" in out

@@ -1,6 +1,6 @@
 [project]
 name = "pio-lock"
-version = "0.4.4"
+version = "0.4.5"
 description = "PlatformIO dependency lockfile tool for reproducible builds"
 readme = "README.md"
 license = "MIT"

@@ -5,6 +5,18 @@ Follows [Keep a Changelog](https://keepachangelog.com/) conventions.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-11-18
+
+### Fixed
+- `capture` in a fresh clone, before any library was installed, locked each env as having no
+  libraries, replacing the committed list. It printed only a warning that
+  `.pio/libdeps/<env>` doesn't exist, and exited 0. An env with `lib_deps` but no installed
+  libraries is now an error, and nothing is written: run `pio-lock restore` (or
+  `pio pkg install`) first. `symlink://` entries and pio-lock itself don't count, since they
+  aren't installed into `.pio/libdeps`.
+- `check` passed such a lock, because the lock and the disk agreed on having no libraries. An env
+  whose lock has no libraries while `lib_deps` lists some is now reported as drift.
+
 ## [0.4.4] - 2026-11-18
 
 ### Fixed
